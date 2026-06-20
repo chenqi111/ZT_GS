@@ -3,10 +3,7 @@
 
 **Qi Chen, Beihang University**
 
-## Overview
-<p align="center" width="100%">
-    <img src="https://github.com/chenqi111/Surgical-TSplineGS/blob/main/figure/2.png?raw=tru"> 
-</p>
+![Teaser figure](figure/2.png)
 
 **Surgical-TSplineGS** is a Topology-Aware Motion-Adaptive Splines for Real-Time Dynamic 3D Reconstruction in Monocular Endoscopy. It extends 4D Gaussian Splatting with:
 
