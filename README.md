@@ -23,8 +23,8 @@ State Key Laboratory of Virtual Reality Technology and Systems, Beihang Universi
 Two conda environments are required (training + depth estimation):
 
 ```sh
-git clone https://github.com/chenqi111/Surgical-TSplineGS.git --recursive
-cd Surgical-TSplineGS
+git clone https://github.com/chenqi111/ZT_GS.git --recursive
+cd ZT_GS
 
 # === Environment 1: Main training env (Python 3.7, CUDA 11.7, PyTorch 1.13.1) ===
 conda create -n splinegs python=3.7
@@ -256,16 +256,34 @@ ZT-GS/
 ├── train.py                      # Main training loop (warm + fine, cyclic paradigm, MG-TPC, TASS)
 ├── eval_nvidia.py                # Quantitative evaluation (PSNR/LPIPS/FPS)
 ├── render_video5.py              # Render RGB/depth/normal from a checkpoint
+├── gen_depth.py                  # UniDepth / Depth-Anything depth map generation
+├── gen_tracks.py                 # CoTracker3 point track generation
+├── gen_tracks_single.py          # Single-video track generation
 ├── gen_depth_gray.py             # Generate grayscale depth maps from .npy
-├── gen_depth.py / gen_tracks.py  # Depth & point-track generation
-├── prep_video5.py                # Helper: truncate frames & regenerate masks for video_5
-├── compute_metrics.py            # Automated surgical metric computation
-├── compute_mase.py               # MASE metric
 ├── gen_heatmap.py                # Motion heatmap visualization
 ├── gen_split_figures.py          # TASS split-event figures
-├── run_train.sh                  # Env wrapper for training
+├── gen_tech_pdf.py               # Technical solution PDF generator (Chinese)
+├── gen_tech_report.py            # Deep technical report PDF generator
+├── gen_qa_pdf.py                 # Q&A PDF generator
+├── compute_metrics.py            # Automated surgical metric computation
+├── compute_mase.py               # MASE metric computation
+├── create_masks.py               # Dummy motion mask creation
+├── prep_video5.py                # Helper: truncate frames & regenerate masks for video_5
+├── prep_video1.py                # Helper: prepare video_1 data (gt, instance masks)
+├── prep_instance_masks.py        # Helper: create dummy instance masks
+├── prep_pulling_data.py          # Helper: prepare pulling scene data
+├── gen_dummy_tracks*.py          # Dummy track generators for quick testing
+├── run_train.sh                  # Env wrapper for training (sets CUDA/LD paths)
 ├── train_surgical.sh             # Surgical training launcher
-└── run_eval.sh                   # Env wrapper for evaluation
+├── train.sh                      # Batch train Nvidia scenes
+├── eval.sh                       # Batch evaluate Nvidia scenes
+├── run_eval.sh                   # Env wrapper for evaluation
+├── gen_depth.sh / gen_tracks.sh  # Batch depth/track generation scripts
+├── install.sh                    # Automated environment installation
+├── requirements.txt              # Python deps (training env)
+├── requirements_unidepth.txt     # Python deps (depth estimation env)
+├── ZT_GS.pdf                     # Paper: ZT-GS manuscript
+└── figure/                       # Teaser / result figures
 ```
 
 ## 🧪 Example Results (video_5)
@@ -289,7 +307,8 @@ If you find this repository useful, please consider citing:
 @misc{Chen_2026_ZT_GS,
     author    = {Chen, Qi and Xia, Qing and Gao, Yang and Li, Shuai and Hao, Aimin},
     title     = {ZT-GS: Zernike Spectral Trajectory Field with Topology-Aware Splitting for Dynamic Endoscopic Reconstruction},
-    year      = {2026}
+    year      = {2026},
+    url       = {https://github.com/chenqi111/ZT_GS}
 }
 ```
 -->
