@@ -14,9 +14,9 @@ State Key Laboratory of Virtual Reality Technology and Systems, Beihang Universi
 - **Mask-Guided Frequency-Selective Occlusion Handling (MG-TPC)** — Spectral-order-dependent gradient masking that aggressively freezes high-order coefficients under tool occlusion while preserving low-order physiological inertia and anchoring the zero-order centroid (`gaussian_model.py:489`, Eq. 4).
 - **Topology-Aware Spectral Splitting (TASS)** — Detects irreversible tissue ruptures via spectral-entropy surges and performs frequency-selective trajectory bifurcation: low-order motion stays shared, high-order motion diverges independently for opposing tissue lips (`gaussian_model.py:528-642`, Eq. 5-7).
 - **Cyclic Spatio-Temporal Evolution Paradigm** — Traverses the sequence forward (t=1→T) then backward (t=T→1) per epoch with bidirectional gradient accumulation, refining spectral coefficients from future observations (`train.py`, Eq. 12).
-- **Spectral-Sparsity Loss** — L1 penalty on Zernike coefficients (excluding the zero-order centroid) replaces Hermite-spline second-derivative regularization, pruning redundant high-order modes (`utils/loss_utils.py:221`).
+<!-- - **Spectral-Sparsity Loss** — L1 penalty on Zernike coefficients (excluding the zero-order centroid) replaces Hermite-spline second-derivative regularization, pruning redundant high-order modes (`utils/loss_utils.py:221`).
 - **Spectral-Anchored Depth Consistency** — Monocular depth prior with a Dirichlet boundary condition anchoring the zeroth spectral moment to physical depth, eliminating scale drift (`utils/loss_utils.py:185`, Eq. 11).
-- **Dual-Environment Pipeline** — UniDepth (metric depth) + Depth-Anything (disparity) + CoTracker3 (long-range point tracks) for COLMAP-free geometric initialization.
+- **Dual-Environment Pipeline** — UniDepth (metric depth) + Depth-Anything (disparity) + CoTracker3 (long-range point tracks) for COLMAP-free geometric initialization. -->
 
 ## ⚙️ Environmental Setups
 
@@ -286,7 +286,7 @@ ZT-GS/
 └── figure/                       # Teaser / result figures
 ```
 
-## 🧪 Example Results (video_5)
+<!-- ## 🧪 Example Results (video_5)
 
 Trained 30k iterations on 20 frames (480×640) with `arguments/surgical/default.py`:
 
@@ -298,9 +298,9 @@ Trained 30k iterations on 20 frames (480×640) with `arguments/surgical/default.
 | ZSTF modes | 49 (N=6) |
 | Render speed | >100 FPS |
 
-Renders: `output/video_5/render_results/{rgb,depth,depth_gray,normal,gt,compare,compare_gray}/`
+Renders: `output/video_5/render_results/{rgb,depth,depth_gray,normal,gt,compare,compare_gray}/` -->
 
-<!-- ## ⭐ Citing ZT-GS
+## ⭐ Citing ZT-GS
 
 If you find this repository useful, please consider citing:
 ```bibtex
@@ -311,4 +311,4 @@ If you find this repository useful, please consider citing:
     url       = {https://github.com/chenqi111/ZT_GS}
 }
 ```
--->
+
