@@ -1,12 +1,15 @@
-# Surgical-TSplineGS default config
-# Based on paper: Sec IV-A Implementation Details
+# Surgical-TSplineGS / ZT-GS default config
+# Based on paper: ZT_GS.pdf Sec IV-A Implementation Details
 
 # Dataset
 dataset_type = "surgical"
 depth_type = "depth"
 
-# Model - surgical uses K=6 control points (paper Sec IV-A)
-control_num = 6
+# Model - ZSTF (Zernike Spectral Trajectory Field), paper Sec. III-A / IV-A
+zernike_N = 6                          # max radial order N (paper: N=6, M=(N+1)^2=49 modes)
+zernike_omega = 4.0                    # temporal winding number omega (paper: omega=4)
+zernike_beta = 0.5                     # exponential decay beta (paper: beta=0.5)
+control_num = 6                        # legacy alias, interpreted as N by GaussianModel
 deform_spatial_scale = 1e-2
 prune_error_threshold = 0.5
 sh_degree = 3
@@ -33,21 +36,27 @@ rotation_lr = 0.001
 omega_lr = 0.0001
 rgb_lr = 0.0001
 
-# Loss weights (paper Eq. 7)
-lambda_dssim = 0.2                    # λ_ssim
-w_depth = 0.5                         # part of λ_depth
+# Loss weights (paper Eq. 8)
+lambda_dssim = 0.2                    # lambda_ssim
+w_depth = 0.5                         # part of lambda_depth
 w_mask = 1.0
 w_track = 1.0
 w_normal = 0
 
-# Surgical-TSplineGS hyperparameters
-tass_epsilon = 0.05                   # ε_top: photometric error threshold
-tass_gamma = 2.0                      # γ: MG-MAS gradient scaling
-mgmas_enabled = True
+# ZT-GS hyperparameters
+tass_epsilon = 0.15                   # epsilon_entropy: spectral-entropy rupture threshold (Sec. IV-A)
+tass_gamma = 2.0                      # gamma: MG-TPC gradient scaling (Eq. 4)
+tass_nlow = 2                         # N_low: low/high frequency boundary for bifurcation (Eq. 7)
+mgtpc_tau0 = 0.01                     # tau_0: spectral-order gradient gate base (Eq. 4)
+mgmas_enabled = True                  # enable MG-TPC (legacy alias name kept)
 tass_enabled = True
-lambda_depth_consistency = 0.5        # λ_depth (Eq. 10)
-lambda_traj_smoothness = 0.1          # λ_smooth (Eq. 11)
-lambda_masked_rgb = 1.0               # λ_rgb (Eq. 8)
+lambda_depth_consistency = 0.5        # lambda_depth (Eq. 11)
+lambda_traj_smoothness = 0.01         # lambda_sparse: spectral sparsity (Eq. 8)
+lambda_masked_rgb = 1.0               # lambda_rgb (Eq. 9)
+
+# Cyclic Spatio-Temporal Evolution Paradigm (Eq. 12)
+cyclic_st_enabled = True              # forward+backward traversal, bidirectional grad accumulation
+cyclic_accum_steps = 2                # # of grads (forward+backward) accumulated per update
 
 # Densification
 densify_from_iter = 500
@@ -60,6 +69,6 @@ densify = 1
 desicnt = 6
 opthr = 0.005
 
-# Initial points
-stat_npts = 30000
-dyn_npts = 30000
+# Initial points (reduced for memory-constrained GPU)
+stat_npts = 10000
+dyn_npts = 10000

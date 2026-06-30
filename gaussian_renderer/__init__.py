@@ -13,100 +13,102 @@ import torch
 import torch.nn.functional as F
 from gsplat.rendering import rasterization, fully_fused_projection
 from scene.gaussian_model import GaussianModel
+from scene.zernike import (
+    evaluate_zernike_batched,
+    evaluate_zernike,
+    num_modes as zernike_num_modes,
+    build_mode_list,
+    _radial_poly,
+)
 import cv2
 
 
-# @torch.jit.script
-def interpolate_cubic_hermite(signal, times, N):
-    # start.record()
-    times_scaled = times * (N - 1)[:, None]
-    indices = torch.floor(times_scaled).long()
-    # Clamping to avoid out-of-bounds indices
+def interpolate_zernike(coeffs, times, N, omega, beta, T=1.0):
+    """
+    ZSTF evaluation for training (batched per-Gaussian time).
 
-    indices = torch.clamp(
-        indices, torch.zeros_like(N)[:, None].expand(-1, 3, -1), (N - 2)[:, None].expand(-1, 3, -1)
-    ).long()
-    left_indices = torch.clamp(
-        indices - 1, torch.zeros_like(N)[:, None].expand(-1, 3, -1), (N - 1)[:, None].expand(-1, 3, -1)
-    ).long()
-    right_indices = torch.clamp(
-        indices + 1, torch.zeros_like(N)[:, None].expand(-1, 3, -1), (N - 1)[:, None].expand(-1, 3, -1)
-    ).long()
-    right_right_indices = torch.clamp(
-        indices + 2, torch.zeros_like(N)[:, None].expand(-1, 3, -1), (N - 1)[:, None].expand(-1, 3, -1)
-    ).long()
-
-    t = times_scaled - indices.float()
-    p0 = torch.gather(signal, -1, left_indices)
-    p1 = torch.gather(signal, -1, indices)
-    p2 = torch.gather(signal, -1, right_indices)
-    p3 = torch.gather(signal, -1, right_right_indices)
-
-    # One-sided derivatives at the boundaries
-    m0 = torch.where(left_indices == indices, (p2 - p1), (p2 - p0) / 2)
-    m1 = torch.where(right_right_indices == right_indices, (p2 - p1), (p3 - p1) / 2)
-
-    # Hermite basis functions
-    h00 = (1 + 2 * t) * (1 - t) ** 2
-    h10 = t * (1 - t) ** 2
-    h01 = t**2 * (3 - 2 * t)
-    h11 = t**2 * (t - 1)
-
-    interpolation = h00 * p1 + h10 * m0 + h01 * p2 + h11 * m1
-    # if len(signal.shape) == 3:  # remove extra singleton dimension
-    interpolation = interpolation.squeeze(-1)
-    # end.record()
-    # torch.cuda.synchronize()
-    # print('v1:', start.elapsed_time(end))
-    return interpolation
+    Args:
+        coeffs: [B, M, 3] Zernike spectral coefficients (control_xyz)
+        times:  [B, 3, 1] or [B, 1] per-Gaussian normalized time (same value
+                replicated across the 3 channels by the caller)
+        N, omega, beta, T: ZSTF hyperparameters
+    Returns:
+        mu: [B, 3] trajectory displacement
+    """
+    # times may arrive as [B, 3, 1] from the legacy Hermite calling convention;
+    # collapse to per-Gaussian scalar t.
+    if times.dim() == 3:
+        t = times[..., 0, 0]  # [B]
+    elif times.dim() == 2:
+        t = times[:, 0]
+    else:
+        t = times
+    mu = evaluate_zernike_batched(coeffs, t, N=N, omega=omega, beta=beta, T=T)
+    return mu
 
 
-# @torch.jit.script
-def interpolate_cubic_hermite_infer(signal, times, N, index_offset):
-    # start.record()
-    times_scaled = times * (N - 1)
-    indices = torch.floor(times_scaled).long()
-
-    # Clamping to avoid out-of-bounds indices
-    indices = torch.clamp(indices, torch.zeros_like(N).expand(-1, 3), (N - 2).expand(-1, 3)).long()
-    left_indices = torch.clamp(indices - 1, torch.zeros_like(N).expand(-1, 3), (N - 1).expand(-1, 3)).long()
-    right_indices = torch.clamp(indices + 1, torch.zeros_like(N).expand(-1, 3), (N - 1).expand(-1, 3)).long()
-    right_right_indices = torch.clamp(indices + 2, torch.zeros_like(N).expand(-1, 3), (N - 1).expand(-1, 3)).long()
-
-    t = times_scaled - indices.float()
-    p0 = torch.gather(signal, 0, left_indices + index_offset)
-    p1 = torch.gather(signal, 0, indices + index_offset)
-    p2 = torch.gather(signal, 0, right_indices + index_offset)
-    p3 = torch.gather(signal, 0, right_right_indices + index_offset)
-
-    # One-sided derivatives at the boundaries
-    m0 = torch.where(left_indices == indices, (p2 - p1), (p2 - p0) / 2)
-    m1 = torch.where(right_right_indices == right_indices, (p2 - p1), (p3 - p1) / 2)
-
-    # Hermite basis functions
-    h00 = (1 + 2 * t) * (1 - t) ** 2
-    h10 = t * (1 - t) ** 2
-    h01 = t**2 * (3 - 2 * t)
-    h11 = t**2 * (t - 1)
-
-    interpolation = h00 * p1 + h10 * m0 + h01 * p2 + h11 * m1
-    # end.record()
-    # torch.cuda.synchronize()
-    # print('v2:', start.elapsed_time(end))
-    return interpolation
+def interpolate_zernike_infer(flat_coeffs, times, N, omega, beta, T=1.0, n_gaussians=None, index_offset=None):
+    """
+    ZSTF evaluation for inference. With the spectral representation all
+    Gaussians share the same number of modes M=(N+1)^2, so the flattened
+    storage is simply a reshape. index_offset is accepted for API symmetry
+    with the legacy Hermite inference path.
+    """
+    M = zernike_num_modes(N)
+    if flat_coeffs.dim() == 1:
+        total = flat_coeffs.shape[0]
+        ng = total // (M * 3)
+        coeffs = flat_coeffs.view(ng, M, 3)
+    elif flat_coeffs.dim() == 2 and flat_coeffs.shape[1] == 3:
+        # flat_control_xyz is stored as [N*M, 3] -> reshape to [N, M, 3]
+        ng = flat_coeffs.shape[0] // M
+        coeffs = flat_coeffs.view(ng, M, 3)
+    elif flat_coeffs.dim() == 3:
+        coeffs = flat_coeffs
+    else:
+        # Fallback: try to reshape from [N*M, 3]
+        ng = flat_coeffs.shape[0] // M
+        coeffs = flat_coeffs.view(ng, M, 3)
+    if times.dim() == 2:
+        t = times[:, 0]
+    elif times.dim() == 3:
+        t = times[..., 0, 0]
+    else:
+        t = times
+    mu = evaluate_zernike_batched(coeffs, t, N=N, omega=omega, beta=beta, T=T)
+    return mu
 
 
-def compute_motion_type(control_xyz, current_control_num=None):
+def compute_motion_type(control_xyz, current_control_num=None, zernike_params=None):
     """
     Compute motion type and magnitude for each dynamic Gaussian (fully vectorized).
-    Only uses valid control points for each Gaussian.
+    For the Zernike spectral representation, control_xyz holds spectral coefficients
+    [B, M, 3]; we sample the trajectory at a few time points to derive motion
+    statistics. For legacy spline control points [B, K, 3] the original diff-based
+    path is used when zernike_params is None.
+
     Returns:
         motion_score: in [0, 1], higher = more like rigid-body motion (large, straight displacement)
-        motion_magnitude: total path length (sum of chord lengths between control points)
+        motion_magnitude: total path length (sum of chord lengths between samples)
         rigidity_score: straightness * smoothness in [0, 1]
         velocity_consistency: how consistent the velocity magnitude is across segments
     """
     B, N, _ = control_xyz.shape
+
+    if zernike_params is not None:
+        # Sample the Zernike trajectory at S sample times and reuse the same
+        # statistics as the spline branch on the sampled positions.
+        N_z, omega, beta = zernike_params
+        S = max(int(current_control_num.squeeze()[0].item()) if current_control_num is not None else 8, 8)
+        S = min(S, 16)
+        t_samples = torch.linspace(0.0, 1.0, S, device=control_xyz.device)
+        sampled = []
+        for ts in t_samples:
+            mu = evaluate_zernike_batched(control_xyz, ts.expand(B), N=N_z, omega=omega, beta=beta, T=1.0)
+            sampled.append(mu)
+        control_xyz = torch.stack(sampled, dim=1)  # [B, S, 3]
+        current_control_num = None
+        N = S
 
     if current_control_num is not None:
         ccn = current_control_num.squeeze().long()
@@ -213,10 +215,13 @@ def render(
 
     control_xyz = dyn_pc.get_control_xyz.cuda()
     curr_time = torch.tensor(viewpoint_camera.time).cuda()
-    deform_means3D = interpolate_cubic_hermite(
-        control_xyz.permute(0, 2, 1),
+    deform_means3D = interpolate_zernike(
+        control_xyz,
         curr_time[None, None].expand(control_xyz.shape[0], 3, 1),
-        N=dyn_pc.current_control_num,
+        N=dyn_pc.zernike_N,
+        omega=dyn_pc.zernike_omega,
+        beta=dyn_pc.zernike_beta,
+        T=1.0,
     )
     means3D = deform_means3D * dyn_pc.deform_spatial_scale
 
@@ -489,7 +494,11 @@ def render(
     # Classify dynamic Gaussians into 3 categories: static=0, tissue=0.5, instrument=1.0
     with torch.no_grad():
         motion_score, motion_magnitude, rigidity_score, velocity_consistency = \
-            compute_motion_type(dyn_pc.get_control_xyz, dyn_pc.current_control_num)
+            compute_motion_type(
+                dyn_pc.get_control_xyz,
+                dyn_pc.current_control_num,
+                zernike_params=(dyn_pc.zernike_N, dyn_pc.zernike_omega, dyn_pc.zernike_beta),
+            )
 
     ccn = dyn_pc.current_control_num.squeeze()
 
@@ -818,11 +827,18 @@ def render_infer(viewpoint_camera,
 
     control_xyz = dyn_pc.flat_control_xyz.cuda()
     # start.record()
-    deform_means3D = interpolate_cubic_hermite_infer(control_xyz, torch.tensor(viewpoint_camera.time).cuda()[None].expand(means3D.shape[0], 3), N=dyn_pc.current_control_num, index_offset=dyn_pc.index_offset)
+    deform_means3D = interpolate_zernike_infer(
+        control_xyz,
+        torch.tensor(viewpoint_camera.time).cuda()[None].expand(means3D.shape[0], 3),
+        N=dyn_pc.zernike_N,
+        omega=dyn_pc.zernike_omega,
+        beta=dyn_pc.zernike_beta,
+        T=1.0,
+        index_offset=dyn_pc.index_offset,
+    )
     # end.record()
     # torch.cuda.synchronize()
-    # print('spline time:', start.elapsed_time(end) / means3D.shape[0])
-    # duration = start.elapsed_time(end) / means3D.shape[0]
+    # print('zernike time:', start.elapsed_time(end) / means3D.shape[0])
 
     means3D = deform_means3D * 1e-2
     # Apply activations

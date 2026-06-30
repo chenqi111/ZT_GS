@@ -220,58 +220,29 @@ def depth_consistency_loss(rendered_depth, depth_prior, confidence=None):
 
 def trajectory_smoothness_loss(gaussians, time_grid=10):
     """
-    Penalty on second derivative (acceleration) of spline trajectories (Eq. 11).
-    
-    gaussians: GaussianModel instance with control_xyz and current_control_num
-    time_grid: number of samples along the trajectory for numerical integration
+    Spectral sparsity loss for the Zernike Spectral Trajectory Field
+    (ZT_GS.pdf Eq. 8, lambda_sparse term).
+
+    Replaces the Hermite-spline second-derivative penalty. In the spectral
+    domain, smoothness is enforced by an L1 penalty on the Zernike spectral
+    coefficients C_{n,m}^{(g)}, which encourages compact representations and
+    prunes redundant high-order modes. The zero-order coefficient (global
+    centroid) is excluded from the penalty to avoid suppressing the mean
+    position.
+
+    Args:
+        gaussians:   GaussianModel with control_xyz [N, M, 3] Zernike coeffs
+        time_grid:   retained for API compatibility (unused in spectral form)
     """
-    control_xyz = gaussians.control_xyz  # [N, K, 3]
-    ccn = gaussians.current_control_num.squeeze().long()  # [N]
-    N = control_xyz.shape[0]
-    K = control_xyz.shape[1]
-    
-    total_loss = 0.0
-    for g_idx in range(N):
-        k = ccn[g_idx]
-        if k < 4:
-            continue
-        pts = control_xyz[g_idx, :k]  # [k, 3]
-        # Sample trajectory at regular intervals
-        t = torch.linspace(0, 1, time_grid, device=pts.device)
-        dt = 1.0 / (time_grid - 1)
-        
-        # Evaluate spline at sample points
-        sampled = torch.zeros(time_grid, 3, device=pts.device)
-        for i in range(time_grid):
-            # Find segment for this t
-            seg_t = t[i] * (k - 1)
-            seg_idx = int(seg_t)
-            seg_idx = min(max(seg_idx, 0), k - 2)
-            local_t = seg_t - seg_idx
-            
-            idx0 = max(seg_idx - 1, 0)
-            idx1 = seg_idx
-            idx2 = min(seg_idx + 1, k - 1)
-            idx3 = min(seg_idx + 2, k - 1)
-            
-            p0, p1, p2, p3 = pts[idx0], pts[idx1], pts[idx2], pts[idx3]
-            
-            # One-sided derivatives
-            m0 = (p2 - p0) / 2 if idx0 != idx1 else (p2 - p1)
-            m1 = (p3 - p1) / 2 if idx3 != idx2 else (p2 - p1)
-            
-            h00 = (1 + 2 * local_t) * (1 - local_t) ** 2
-            h10 = local_t * (1 - local_t) ** 2
-            h01 = local_t ** 2 * (3 - 2 * local_t)
-            h11 = local_t ** 2 * (local_t - 1)
-            
-            sampled[i] = h00 * p1 + h10 * m0 + h01 * p2 + h11 * m1
-        
-        # Central difference for acceleration
-        accel = sampled[2:] - 2 * sampled[1:-1] + sampled[:-2]
-        total_loss += torch.mean(accel ** 2)
-    
-    return total_loss / max(N, 1)
+    coeffs = gaussians.control_xyz  # [N, M, 3]
+    if not hasattr(gaussians, "_mode_orders") or gaussians._mode_orders.shape[0] != coeffs.shape[1]:
+        from scene.zernike import mode_orders
+        ns = mode_orders(gaussians.zernike_N, device=coeffs.device)
+    else:
+        ns = gaussians._mode_orders.to(coeffs.device)
+    # Mask out the zero-order mode (n=0): do not penalize the global centroid.
+    non_zero = (ns != 0).float().view(1, -1, 1)
+    return (coeffs.abs() * non_zero).mean()
 
 
 def l2_loss(network_output, gt, mask=None):

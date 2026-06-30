@@ -1,29 +1,34 @@
-<div><h2>Surgical-TSplineGS: Topology-Aware Motion-Adaptive Splines for Real-Time Dynamic 3D Reconstruction in Monocular Endoscopy</h2></div>
+<div><h2>ZT-GS: Zernike Spectral Trajectory Field with Topology-Aware Splitting for Dynamic Endoscopic Reconstruction</h2></div>
 <br>
 
-**Qi Chen, Beihang University**
+**Qi Chen, Qing Xia, Yang Gao, Shuai Li, Aimin Hao**
+State Key Laboratory of Virtual Reality Technology and Systems, Beihang University
 
 ![Teaser figure](figure/2.png)
 
-**Surgical-TSplineGS** is a Topology-Aware Motion-Adaptive Splines for Real-Time Dynamic 3D Reconstruction in Monocular Endoscopy. It extends 4D Gaussian Splatting with:
+**ZT-GS** is a COLMAP-free dynamic 3D Gaussian Splatting framework tailored for monocular endoscopic surgical scenes. It replaces conventional piecewise polynomial trajectory interpolation (cubic Hermite splines) with a global spectral decomposition on a conformally embedded unit disk, enabling frequency disentanglement, analytic differentiability, and compact parameterization. The framework is described in `ZT_GS.pdf`.
 
-- **Topology-Aware Spline Splitting (TASS)** — detects photometric error spikes, splits continuous splines into child trajectories to model tissue cutting.
-- **Mask-Guided Motion-Adaptive Spline (MG-MAS)** — uses tool masks to freeze gradients in occluded regions, decoupling rigid instrument motion from tissue deformation.
-- **Cubic Hermite Spline Interpolation** — Smooth trajectory modeling with motion-adaptive control points (K=6 for surgical, K=12 for general).
-- **Motion Type Classification** — Automatically classifies Gaussians as static / tissue / instrument for targeted optimization.
-- **Dual-Environment Pipeline** — Uses UniDepth (metric depth) and Depth-Anything (disparity) with CoTracker3 (long-range point tracks) for robust geometric initialization.
+## ✨ Key Features
+
+- **Zernike Spectral Trajectory Field (ZSTF)** — Each Gaussian's center trajectory is expanded as a weighted superposition of orthogonal Zernike-Sobolev basis functions on a conformally embedded unit disk (N=6 → 49 modes), replacing cubic Hermite control points. Init via least-squares fitting to 2D tracks (`scene/zernike.py`).
+- **Mask-Guided Frequency-Selective Occlusion Handling (MG-TPC)** — Spectral-order-dependent gradient masking that aggressively freezes high-order coefficients under tool occlusion while preserving low-order physiological inertia and anchoring the zero-order centroid (`gaussian_model.py:489`, Eq. 4).
+- **Topology-Aware Spectral Splitting (TASS)** — Detects irreversible tissue ruptures via spectral-entropy surges and performs frequency-selective trajectory bifurcation: low-order motion stays shared, high-order motion diverges independently for opposing tissue lips (`gaussian_model.py:528-642`, Eq. 5-7).
+- **Cyclic Spatio-Temporal Evolution Paradigm** — Traverses the sequence forward (t=1→T) then backward (t=T→1) per epoch with bidirectional gradient accumulation, refining spectral coefficients from future observations (`train.py`, Eq. 12).
+- **Spectral-Sparsity Loss** — L1 penalty on Zernike coefficients (excluding the zero-order centroid) replaces Hermite-spline second-derivative regularization, pruning redundant high-order modes (`utils/loss_utils.py:221`).
+- **Spectral-Anchored Depth Consistency** — Monocular depth prior with a Dirichlet boundary condition anchoring the zeroth spectral moment to physical depth, eliminating scale drift (`utils/loss_utils.py:185`, Eq. 11).
+- **Dual-Environment Pipeline** — UniDepth (metric depth) + Depth-Anything (disparity) + CoTracker3 (long-range point tracks) for COLMAP-free geometric initialization.
 
 ## ⚙️ Environmental Setups
 
-Clone the repo and install dependencies (two conda environments required):
+Two conda environments are required (training + depth estimation):
 
 ```sh
 git clone https://github.com/chenqi111/Surgical-TSplineGS.git --recursive
 cd Surgical-TSplineGS
 
 # === Environment 1: Main training env (Python 3.7, CUDA 11.7, PyTorch 1.13.1) ===
-conda create -n surgical_tsplinegs python=3.7
-conda activate surgical_tsplinegs
+conda create -n splinegs python=3.7
+conda activate splinegs
 export CUDA_HOME=$CONDA_PREFIX
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib
 
@@ -39,8 +44,8 @@ pip install -r requirements.txt
 
 # === Environment 2: Depth estimation env (Python 3.10, CUDA 12.1, PyTorch 2.4) ===
 conda deactivate
-conda create -n unidepth_surgical_tsplinegs python=3.10
-conda activate unidepth_surgical_tsplinegs
+conda create -n unidepth_splinegs python=3.10
+conda activate unidepth_splinegs
 
 pip install -r requirements_unidepth.txt
 conda install -c conda-forge ld_impl_linux-64
@@ -67,84 +72,70 @@ bash install.sh
 ### Download Depth-Anything Checkpoint
 
 ```sh
-# Download depth_anything_vitl14.pth and place at:
-# submodules/mega-sam/Depth-Anything/checkpoints/depth_anything_vitl14.pth
 wget https://huggingface.co/spaces/LiheYoung/Depth-Anything/blob/main/checkpoints/depth_anything_vitl14.pth \
   -O submodules/mega-sam/Depth-Anything/checkpoints/depth_anything_vitl14.pth
 ```
+
 ## 📁 Data Preparations
 
-### EndoNeRF Dataset
+Each scene directory should ultimately contain:
+```
+data/{scene}/
+├── images_2/                  # RGB frames (000.png, 001.png, ...)  [3-digit naming]
+├── uni_depth/                 # UniDepth metric depth priors (000.npy, ...)
+├── bootscotracker_dynamic/    # CoTracker3 dynamic point tracks ({q}_{t}.npy)
+├── bootscotracker_static/     # CoTracker3 static point tracks
+├── instance_mask/{:03d}/000.png  # Per-frame tool masks (optional, dummy OK)
+├── motion_masks/              # Motion masks for track sampling
+├── normal/                    # Surface normals (auto-generated from depth)
+├── dummy_points3D.ply         # Auto-generated if missing
+└── gt/                        # Ground truth images
+```
 
-1. Download the training images from the [release page](https://github.com/med-air/EndoNeRF?tab=readme-ov-file) 
+### Generate Depth Maps and Point Tracks
 
-
-Each scene should contain:
-- `images_2/` — Downscaled (2x) input images
-- `instance_masks/` — Per-frame instance masks (surgical instruments)
-- `motion_masks/` — Motion masks from [Shape of Motion](https://github.com/vye16/shape-of-motion/) 
-- `gt/` — Ground truth images (symlinked from images_2)
-
-2. Generate depth maps and point tracks:
 ```sh
-# Depth estimation (UniDepth + Depth-Anything)
-conda activate unidepth_surgical_tsplinegs
-bash gen_depth.sh
+# 1. Depth estimation (UniDepth metric depth)
+conda activate unidepth_splinegs
+python gen_depth.py --image_dir data/{scene}/images_2 --out_dir data/{scene}/uni_depth
+# (optional) Depth-Anything disparity
+python gen_depth.py --image_dir data/{scene}/images_2 --out_dir data/{scene}/depth_anything --depth_type disp
 
 conda deactivate
-conda activate surgical_tsplinegs
+conda activate splinegs
 
-# Long-range point tracks (CoTracker3)
-bash gen_tracks.sh
+# 2. Long-range point tracks (CoTracker3)
+#    grid_size=25 recommended for 480×640 long sequences (memory-safe)
+python gen_tracks.py --image_dir data/{scene}/images_2 --mask_dir data/{scene}/motion_masks \
+    --out_dir data/{scene}/bootscotracker_dynamic --grid_size 25
+python gen_tracks.py --image_dir data/{scene}/images_2 --mask_dir data/{scene}/motion_masks \
+    --out_dir data/{scene}/bootscotracker_static --grid_size 25 --is_static
+
+# 3. Dummy motion masks / instance masks (if no real tool masks)
+python create_masks.py        # adapt path inside
 ```
 
-### Custom Surgical Dataset
+> **Note on sequence length**: CoTracker3 offline memory grows quadratically with sequence length. For 480×640 frames on a 16GB GPU, keep sequences ≤ ~30 frames at `grid_size=25`, or reduce `grid_size` for longer sequences. See `prep_video5.py` for a helper that truncates frames and regenerates masks.
 
-1. Prepare your video frames under `data/{dataset_name}/images_2/`.
-2. Create instance masks (optional, for instrument masking) in `data/{dataset_name}/instance_masks/` — each frame subdirectory `{:03d}/` containing `000.png`.
-3. Generate depth maps:
-```sh
-conda activate unidepth_surgical_tsplinegs
-python gen_depth.py --image_dir data/{dataset_name}/images_2 --out_dir data/{dataset_name}/uni_depth
-python gen_depth.py --image_dir data/{dataset_name}/images_2 --out_dir data/{dataset_name}/depth_anything --depth_type disp
-```
-4. Generate point tracks:
-```sh
-conda activate surgical_tsplinegs
-python gen_tracks.py --image_dir data/{dataset_name}/images_2 --out_dir data/{dataset_name}/bootscotracker_dynamic --grid_size 256
-python gen_tracks.py --image_dir data/{dataset_name}/images_2 --out_dir data/{dataset_name}/bootscotracker_static --grid_size 50 --is_static
-```
-5. Create a configuration file at `arguments/{dataset_name}/{scene}.py` inheriting from `arguments/surgical/default.py`.
-6. Create motion masks (optional): use `create_masks.py` for dummy masks or generate using Shape of Motion.
 ## 🚀 Training
 
-<!-- ### Nvidia Dataset -->
-
 ```sh
-conda activate surgical_tsplinegs
+conda activate splinegs
 
-# Train a single scene (use run_train.sh wrapper to set env)
-python train.py -s data/nvidia_rodynrf/pulling/ --expname "Pulling" --configs arguments/nvidia_rodynrf/pulling.py
-
-# Or via the env wrapper:
-bash run_train.sh train.py -s data/nvidia_rodynrf/pulling/ --expname "Pulling" --configs arguments/nvidia_rodynrf/pulling.py
-
-# Batch train all 7 Nvidia scenes
-bash train.sh
-```
-
-### Custom Surgical Dataset
-
-```sh
-conda activate surgical_tsplinegs
-
-# Use the surgical training wrapper
-bash train_surgical.sh /path/to/scene my_experiment_name
-
-# Or manually:
-python train.py -s /path/to/scene/ --expname "my_experiment" \
+# Train a surgical scene (e.g. video_5) with the ZT-GS default config
+python train.py -s data/video_5 --expname "video_5" \
     --configs arguments/surgical/default.py \
-    --dataset_type surgical
+    --dataset_type nvidia \
+    --test_iterations 5000 10000 20000 30000 \
+    --save_iterations 5000 10000 20000 30000
+
+# Or via the env wrapper (sets CUDA_HOME / LD_LIBRARY_PATH):
+bash run_train.sh train.py -s data/video_5 --expname "video_5" \
+    --configs arguments/surgical/default.py --dataset_type nvidia
+
+# Nvidia RoDynRF dataset
+python train.py -s data/nvidia_rodynrf/pulling/ --expname "Pulling" \
+    --configs arguments/nvidia_rodynrf/pulling.py
 ```
 
 ### Key Training Arguments
@@ -154,84 +145,151 @@ python train.py -s /path/to/scene/ --expname "my_experiment" \
 | `-s` | Path to scene directory (containing `images_2/`) |
 | `--expname` | Experiment name for output directory |
 | `--configs` | Path to scene-specific `.py` config file |
-| `--dataset_type` | `nvidia` (default) or `surgical` |
+| `--dataset_type` | `nvidia` (default; loads tracks+depth) or `surgical` (minimal loader) |
 | `--depth_type` | `depth` (UniDepth metric) or `disp` (Depth-Anything disparity) |
+| `--test_iterations` | Iterations to run PSNR/LPIPS evaluation and save `fine_best` |
+| `--save_iterations` | Iterations to save checkpoints under `point_cloud/iteration_{N}/` |
 
-Training produces checkpoints in `output/{expname}/`.
+### ZT-GS Hyperparameters (`arguments/surgical/default.py`)
 
-## 📊 Evaluation
+| Parameter | Default | Paper | Description |
+|-----------|---------|-------|-------------|
+| `zernike_N` | 6 | N=6 | Max radial order → M=(N+1)²=49 modes |
+| `zernike_omega` | 4.0 | ω=4 | Temporal winding number |
+| `zernike_beta` | 0.5 | β=0.5 | High-order energy decay |
+| `tass_epsilon` | 0.15 | ε=0.15 | Spectral-entropy rupture threshold |
+| `tass_gamma` | 2.0 | γ=2.0 | MG-TPC gradient scaling |
+| `tass_nlow` | 2 | N_low=2 | Low/high-frequency bifurcation boundary |
+| `mgtpc_tau0` | 0.01 | τ₀=0.01 | Spectral-order gradient gate base |
+| `cyclic_st_enabled` | True | Eq. 12 | Forward+backward traversal |
+| `cyclic_accum_steps` | 2 | Eq. 12 | Bidirectional grad accumulation window |
+| `lambda_depth_consistency` | 0.5 | λ_depth=0.5 | Spectral-anchored depth loss |
+| `lambda_traj_smoothness` | 0.01 | λ_sparse=0.01 | Spectral sparsity (L1) loss |
+| `lambda_masked_rgb` | 1.0 | λ_photo=1.0 | Masked photometric loss |
+| `lambda_dssim` | 0.2 | λ_ssim=0.2 | SSIM loss |
 
-### EndoNeRF Dataset (Full Metrics)
+Training produces checkpoints in `output/{expname}/point_cloud/{iteration_N|fine_best}/`.
+
+## 📊 Rendering & Evaluation
+
+### Render RGB, Depth, and Normal Maps
+
+`render_video5.py` loads a checkpoint and renders novel-view RGB, colorized depth, grayscale depth, and surface normals for all train/test cameras.
 
 ```sh
-conda activate surgical_tsplinegs
+# Render from a specific checkpoint
+python render_video5.py -s data/video_5 --expname video_5 \
+    --configs arguments/surgical/default.py \
+    --checkpoint output/video_5/point_cloud/iteration_30000
 
-# Evaluate a single scene
+# Generate grayscale (black-white) depth maps from rendered .npy
+python gen_depth_gray.py
+```
+
+Outputs are written to `output/{expname}/render_results/`:
+| Subdir | Content |
+|--------|---------|
+| `rgb/` | Rendered RGB images (`{split}_{idx:03d}.png`) |
+| `depth/` | Colorized (turbo) depth PNG + raw `.npy` |
+| `depth_gray/` | Grayscale (single-channel) depth PNG |
+| `normal/` | Surface normals from rendered depth (RGB visualization) |
+| `gt/` | Ground truth images for comparison |
+| `compare/` | Montage: GT \| RGB \| Depth(Color) \| Normal |
+| `compare_gray/` | Montage: GT \| RGB \| Depth(Color) \| Depth(Gray) \| Normal |
+
+### Quantitative Evaluation
+
+```sh
+# PSNR / LPIPS / FPS on a trained checkpoint (Nvidia-format scenes)
 python eval_nvidia.py -s data/nvidia_rodynrf/pulling/ \
     --expname "Pulling" \
     --configs arguments/nvidia_rodynrf/pulling.py \
     --checkpoint output/Pulling/point_cloud/fine_best
 
-# Batch evaluate all scenes
+# Batch evaluate
 bash eval.sh
-```
 
-### Automated Surgical Metrics
-
-```sh
-# Comprehensive metric computation (PSNR, SSIM, tOF, g_def, g_split, FAS)
+# Comprehensive surgical metrics (PSNR, SSIM, tOF, g_def, g_split, FAS)
 bash run_eval.sh
 
-# MASE (Mean Absolute Scaled Error) metric
+# MASE metric
 python compute_mase.py
 ```
 
-### Rendered Visualization
+### Visualization
 
 ```sh
-# Render heatmaps (motion magnitude, rigidity, velocity consistency, motion types)
+# Motion heatmaps (motion magnitude, rigidity, velocity consistency, motion types)
 python gen_heatmap.py --checkpoint output/{expname}/point_cloud/fine_best
 
-# Render Gaussian split events from training logs
+# Gaussian split-event figures from training logs
 python gen_split_figures.py --log logs/{expname}.log
 ```
 
 ## 📁 Project Structure
 
 ```
-Surgical-TSplineGS/
-├── arguments/               # Configuration files (scene-specific .py)
-│   ├── nvidia_rodynrf/      #   Nvidia dataset configs (18 scenes)
-│   └── surgical/            #   Surgical dataset defaults
-├── scene/                   # Scene representation
-│   ├── gaussian_model.py    #   GaussianModel with densification, control points
-│   ├── deformation.py       #   Deformation network, pose network
-│   ├── dataset.py           #   PyTorch Dataset (FourDGSdataset)
-│   └── cameras.py           #   Camera module with pose & time embedding
-├── gaussian_renderer/       # Differentiable rasterization (Hermite interpolation, MG-MAS)
-│   ├── __init__.py          #   Render, render_infer, motion classification
-├── dycheck_geometry/        # Adobe DyCheck camera geometry utilities
+ZT-GS/
+├── scene/                        # Scene & Gaussian representation
+│   ├── zernike.py                #   ZSTF: Zernike-Sobolev basis, conformal embed, fit/evaluate (Eq. 1-2)
+│   ├── gaussian_model.py         #   GaussianModel: ZSTF coeffs, MG-TPC (Eq. 4), TASS (Eq. 5-7), spectral entropy
+│   ├── deformation.py            #   Pose network (COLMAP-free camera optimization)
+│   ├── dataset_readers.py        #   Nvidia & surgical dataset loaders (tracks, depth, normals)
+│   ├── dataset.py                #   FourDGSdataset
+│   └── cameras.py                #   Camera with pose & time embedding
+├── gaussian_renderer/
+│   └── __init__.py               #   render (RGB+ED), render_infer, Zernike interpolation, MG-TPC overlap
+├── arguments/
+│   ├── __init__.py               #   ModelHiddenParams: ZT-GS hyperparameters (γ, ε, τ₀, cyclic, etc.)
+│   ├── surgical/default.py       #   ZT-GS default config (paper Sec. IV-A)
+│   └── nvidia_rodynrf/           #   Nvidia RoDynRF scene configs
+├── utils/
+│   ├── loss_utils.py             #   masked photo, SSIM, spectral sparsity, depth consistency (Eq. 8-11)
+│   ├── graphics_utils.py         #   Projection / point utilities
+│   └── ...                       #   general, image, params, pose, system utils
+├── dycheck_geometry/             # Adobe DyCheck camera geometry
 ├── submodules/
-│   ├── simple-knn/          # KNN distance (Gaussian initialization)
-│   ├── co-tracker/          # CoTracker3 (long-range point tracks)
-│   ├── mega-sam/            # Mega-SAM + Depth-Anything
-│   └── UniDepth/            # Universal monocular depth estimation
-├── utils/                   # Utility modules (losses, graphics, params)
-├── gen_depth.py             # Depth map generation
-├── gen_tracks.py            # CoTracker3 point track generation
-├── train.py                 # Main training loop (1496 lines)
-├── eval_nvidia.py           # Nvidia dataset evaluation
-├── compute_metrics.py       # Automated surgical metric computation
-└── compute_mase.py          # MASE metric computation
+│   ├── simple-knn/               # KNN distance (Gaussian init)
+│   ├── co-tracker/               # CoTracker3 (long-range point tracks)
+│   ├── mega-sam/                 # Mega-SAM + Depth-Anything
+│   └── UniDepth/                 # Universal monocular depth estimation
+├── train.py                      # Main training loop (warm + fine, cyclic paradigm, MG-TPC, TASS)
+├── eval_nvidia.py                # Quantitative evaluation (PSNR/LPIPS/FPS)
+├── render_video5.py              # Render RGB/depth/normal from a checkpoint
+├── gen_depth_gray.py             # Generate grayscale depth maps from .npy
+├── gen_depth.py / gen_tracks.py  # Depth & point-track generation
+├── prep_video5.py                # Helper: truncate frames & regenerate masks for video_5
+├── compute_metrics.py            # Automated surgical metric computation
+├── compute_mase.py               # MASE metric
+├── gen_heatmap.py                # Motion heatmap visualization
+├── gen_split_figures.py          # TASS split-event figures
+├── run_train.sh                  # Env wrapper for training
+├── train_surgical.sh             # Surgical training launcher
+└── run_eval.sh                   # Env wrapper for evaluation
 ```
 
-<!-- ## ⭐ Citing Surgical-TSplineGS
+## 🧪 Example Results (video_5)
 
-If you find our repository useful, please consider giving it a star ⭐ and citing our research papers in your work:
+Trained 30k iterations on 20 frames (480×640) with `arguments/surgical/default.py`:
+
+| Metric | Value |
+|--------|-------|
+| Train PSNR | 40.14 dB |
+| Test PSNR | 25.04 dB (20 views) |
+| Best test PSNR | 25.10 dB @ iter 20000 |
+| ZSTF modes | 49 (N=6) |
+| Render speed | >100 FPS |
+
+Renders: `output/video_5/render_results/{rgb,depth,depth_gray,normal,gt,compare,compare_gray}/`
+
+<!-- ## ⭐ Citing ZT-GS
+
+If you find this repository useful, please consider citing:
 ```bibtex
-@misc{Chen_2025_Surgical_TSplineGS,
-    author    = {Chen, Qi},
-    title     = {Surgical-TSplineGS: Topology-Aware Motion-Adaptive Splines for Real-Time Dynamic 3D Reconstruction in Monocular Endoscopy},
+@misc{Chen_2026_ZT_GS,
+    author    = {Chen, Qi and Xia, Qing and Gao, Yang and Li, Shuai and Hao, Aimin},
+    title     = {ZT-GS: Zernike Spectral Trajectory Field with Topology-Aware Splitting for Dynamic Endoscopic Reconstruction},
     year      = {2026}
 }
-
+```
+-->

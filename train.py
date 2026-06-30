@@ -93,6 +93,18 @@ def scene_reconstruction(
     my_test_cams = [i for i in test_cams]  # Large CPU usage
     viewpoint_stack = [i for i in train_cams]  # Large CPU usage
 
+    # === ZT-GS: Cyclic Spatio-Temporal Evolution Paradigm (Eq. 12) ===
+    # Traverse the sequence forward (t=1->T) then backward (t=T->1) per epoch
+    # and accumulate bidirectional gradients before each optimizer update.
+    cyclic_st_enabled = getattr(hyper, "cyclic_st_enabled", False) and scene.dataset_type == "surgical" and stage == "fine"
+    cyclic_accum_steps = max(int(getattr(hyper, "cyclic_accum_steps", 2)), 1)
+    cyclic_schedule = None
+    cyclic_pos = 0
+    cyclic_iter = 0  # per-iteration counter for accumulation windows
+    if cyclic_st_enabled and len(viewpoint_stack) > 1:
+        n_frames = len(viewpoint_stack)
+        cyclic_schedule = list(range(n_frames)) + list(range(n_frames - 1, -1, -1))
+
     # Get GT cam to worlds for testing
     gt_train_pose_list = []
     for view_p in viewpoint_stack:
@@ -187,12 +199,16 @@ def scene_reconstruction(
 
         idx = 0
         while idx < batch_size:
-            if not viewpoint_stack_ids:
-                viewpoint_stack_ids = list(range(len(viewpoint_stack)))
+            if cyclic_st_enabled and cyclic_schedule is not None:
+                # Cyclic Spatio-Temporal Evolution: ordered forward/backward traversal (Eq. 12)
+                id = cyclic_schedule[cyclic_pos % len(cyclic_schedule)]
+                cyclic_pos += 1
+            else:
+                if not viewpoint_stack_ids:
+                    viewpoint_stack_ids = list(range(len(viewpoint_stack)))
 
-            id = randint(0, len(viewpoint_stack_ids) - 1)
-            
-            id = viewpoint_stack_ids.pop(id)
+                id = randint(0, len(viewpoint_stack_ids) - 1)
+                id = viewpoint_stack_ids.pop(id)
             viewpoint_cams.append(viewpoint_stack[id])
             idx += 1
 
@@ -785,10 +801,27 @@ def scene_reconstruction(
                 smooth_loss_val = trajectory_smoothness_loss(dyn_gaussians, time_grid=10)
                 loss += hyper.lambda_traj_smoothness * smooth_loss_val
         
-        loss.backward()
+        # === ZT-GS: Cyclic Spatio-Temporal Evolution — start of accumulation window ===
+        # Clear gradients at the start of each forward+backward accumulation window
+        # so that gradients from both temporal directions accumulate before the update.
+        if cyclic_st_enabled and (cyclic_iter % cyclic_accum_steps == 0):
+            stat_gaussians.optimizer.zero_grad(set_to_none=True)
+            dyn_gaussians.optimizer.zero_grad(set_to_none=True)
 
-        # === Surgical-TSplineGS: MG-MAS gradient attenuation ===
-        if stage == "fine" and scene.dataset_type == "surgical" and hyper.mgmas_enabled:
+        # In cyclic mode, scale the backwarded loss by 1/accum_steps so the
+        # bidirectionally-accumulated gradient matches a single-step update's
+        # magnitude (standard gradient-accumulation convention). `loss` itself
+        # is left unscaled for logging / NaN checks.
+        if cyclic_st_enabled:
+            (loss / cyclic_accum_steps).backward()
+        else:
+            loss.backward()
+
+        # === Surgical-TSplineGS: MG-TPC frequency-selective gradient attenuation ===
+        # In cyclic mode, apply attenuation once per update window (at the window end)
+        # so that it acts on the bidirectionally-accumulated gradients.
+        mgtpc_window_end = (not cyclic_st_enabled) or (cyclic_iter % cyclic_accum_steps == cyclic_accum_steps - 1)
+        if stage == "fine" and scene.dataset_type == "surgical" and hyper.mgmas_enabled and mgtpc_window_end:
             if dyn_gaussians.control_xyz.grad is not None and render_pkg.get("mg_mas_overlap") is not None:
                 mg_overlap = render_pkg["mg_mas_overlap"]
                 if mg_overlap is not None:
@@ -804,16 +837,17 @@ def scene_reconstruction(
                             dyn_gaussians.control_xyz.grad, dyn_overlap
                         )
 
-        # === Surgical-TSplineGS: TASS detection and splitting ===
-        if stage == "fine" and scene.dataset_type == "surgical" and hyper.tass_enabled:
+        # === Surgical-TSplineGS: TASS spectral-entropy detection and bifurcation ===
+        # In cyclic mode, only split at window end (right after the bidirectional
+        # update) to keep parameter tensor replacement consistent with the step.
+        if stage == "fine" and scene.dataset_type == "surgical" and hyper.tass_enabled and mgtpc_window_end:
             with torch.no_grad():
                 if render_pkg.get("mg_mas_overlap") is not None:
                     mg_overlap = render_pkg["mg_mas_overlap"]
                     if mg_overlap is not None:
                         no_dyn = dyn_gaussians.control_xyz.shape[0]
-                        # Per-Gaussian photometric error
+                        # Per-Gaussian photometric error (fallback signal)
                         pixel_err = torch.abs(image_tensor - gt_image_tensor[:, :3, :, :]).mean(dim=1, keepdim=False)  # [B, H, W]
-                        # Aggregate error per Gaussian using mask overlap as proxy
                         if mg_overlap.shape[0] >= no_stat_gs:
                             dyn_err = mg_overlap[no_stat_gs:no_stat_gs + no_dyn]
                         else:
@@ -821,12 +855,10 @@ def scene_reconstruction(
                         dyn_err_flat = dyn_err.view(-1) if dyn_err.dim() > 1 else dyn_err
                         
                         if iteration % 100 == 0 and dyn_err_flat.shape[0] == no_dyn:
-                            # Sample per-Gaussian error from the 2D projection
                             if "viewspace_points" in render_pkg:
                                 vs_pts = render_pkg["viewspace_points"].squeeze(0)
                                 if vs_pts.shape[0] >= no_stat_gs + no_dyn:
                                     dyn_vs = vs_pts[no_stat_gs:no_stat_gs + no_dyn]
-                                    # Sample pixel error at Gaussian 2D centers
                                     with torch.no_grad():
                                         H, W = gt_image_tensor.shape[2:]
                                         x_norm = 2.0 * dyn_vs[:, 0].clamp(0, W-1) / (W - 1) - 1.0
@@ -839,9 +871,12 @@ def scene_reconstruction(
                                         if err_sampled.dim() > 1:
                                             err_sampled = err_sampled.mean(0)
                                         
-                                        # TASS detection
+                                        # TASS detection via spectral entropy (Eq. 5-6)
                                         if err_sampled.shape[0] == no_dyn:
-                                            split_events = dyn_gaussians.tass_detect_and_split(err_sampled, dyn_err_flat)
+                                            curr_t = viewpoint_cams[0].time if hasattr(viewpoint_cams[0], 'time') else 0.0
+                                            split_events = dyn_gaussians.tass_detect_and_split(
+                                                err_sampled, dyn_err_flat, t_current=curr_t
+                                            )
                                             if split_events:
                                                 print(f"[TASS] Split {len(split_events)} Gaussians at iter {iteration}")
         if torch.isnan(loss).any():
@@ -974,12 +1009,22 @@ def scene_reconstruction(
             timer.start()
 
         # Optimizer step
-        if iteration < opt.iterations:
+        # In cyclic mode, only step at the end of the accumulation window so that
+        # gradients from the forward and backward traversals are summed first (Eq. 12).
+        do_step = (not cyclic_st_enabled) or (cyclic_iter % cyclic_accum_steps == cyclic_accum_steps - 1)
+        if iteration < opt.iterations and do_step:
             stat_gaussians.optimizer.step()
-            stat_gaussians.optimizer.zero_grad(set_to_none=True)
-
             dyn_gaussians.optimizer.step()
-            dyn_gaussians.optimizer.zero_grad(set_to_none=True)
+            if not cyclic_st_enabled:
+                # In cyclic mode grads are cleared at the next window start.
+                stat_gaussians.optimizer.zero_grad(set_to_none=True)
+                dyn_gaussians.optimizer.zero_grad(set_to_none=True)
+        cyclic_iter += 1
+
+        # In cyclic mode, only modify parameters (densify/prune/split) right after a
+        # step (window end) so accumulated bidirectional gradients are not discarded
+        # mid-window by parameter tensor replacement.
+        densify_allowed = (not cyclic_st_enabled) or ((cyclic_iter - 1) % cyclic_accum_steps == cyclic_accum_steps - 1)
 
         # Densification
         if stage != "warm":
@@ -990,23 +1035,26 @@ def scene_reconstruction(
                             dyn_gaussians.max_radii2D[dyn_visibility_filter], dyn_radii[dyn_visibility_filter]
                         )
                         dyn_gaussians.add_densification_stats(dyn_viewspace_point_tensor_grad, dyn_visibility_filter)
-                        flag_d = controlgaussians(opt, dyn_gaussians, densify, iteration, scene, flag_d, is_dynamic=True)
-                        
+                        if densify_allowed:
+                            flag_d = controlgaussians(opt, dyn_gaussians, densify, iteration, scene, flag_d, is_dynamic=True)
+
                         stat_gaussians.max_radii2D[stat_visibility_filter] = torch.max(
                             stat_gaussians.max_radii2D[stat_visibility_filter], stat_radii[stat_visibility_filter]
                         )
                         stat_gaussians.add_densification_stats(stat_viewspace_point_tensor_grad, stat_visibility_filter)
-                        flag_s = controlgaussians(opt, stat_gaussians, densify, iteration, scene, 1000) # only prune
-                        
+                        if densify_allowed:
+                            flag_s = controlgaussians(opt, stat_gaussians, densify, iteration, scene, 1000) # only prune
+
                     elif stage == "fine_static":
                         stat_gaussians.max_radii2D[stat_visibility_filter] = torch.max(
                             stat_gaussians.max_radii2D[stat_visibility_filter], stat_radii[stat_visibility_filter]
                         )
                         stat_gaussians.add_densification_stats(stat_viewspace_point_tensor_grad, stat_visibility_filter)
-                        flag_s = controlgaussians(opt, stat_gaussians, densify, iteration, scene, flag_s)
+                        if densify_allowed:
+                            flag_s = controlgaussians(opt, stat_gaussians, densify, iteration, scene, flag_s)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    if stage == "fine":
+                    if stage == "fine" and densify_allowed:
                         dyn_gaussians.onedown_control_pts(viewpoint_stack)
 
     # scene initialization

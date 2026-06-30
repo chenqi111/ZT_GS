@@ -156,11 +156,18 @@ def evaluate_scene(scene_key):
             dyn_gaussians._posenet.focal_bias.exp().detach().cpu().numpy(),
         )
 
-    # ---- Use render_infer for PSNR/SSIM/tOF (fast) ----
+    # ---- Use render_infer for PSNR/SSIM/LPIPS/tOF (fast) ----
     print(f"  Rendering {len(viewpoint_stack)} frames with render_infer...")
-    psnr_vals, ssim_vals = [], []
+    psnr_vals, ssim_vals, lpips_vals = [], [], []
     rendered_frames = []
     n_max = min(50, len(viewpoint_stack))
+
+    lpips_model = None
+    try:
+        import lpips as _lpips
+        lpips_model = _lpips.LPIPS(net="alex").cuda().eval()
+    except Exception as e:
+        print(f"  [warn] lpips unavailable, skipping LPIPS: {e}")
 
     with torch.no_grad():
         for idx, viewpoint in enumerate(viewpoint_stack[:n_max]):
@@ -169,6 +176,8 @@ def evaluate_scene(scene_key):
             gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
             psnr_vals.append(psnr(image, gt_image).mean().double().item())
             ssim_vals.append(ssim(image.unsqueeze(0), gt_image.unsqueeze(0)).mean().double().item())
+            if lpips_model is not None:
+                lpips_vals.append(lpips_model((2.0 * image - 1.0)[None], (2.0 * gt_image - 1.0)[None]).item())
             img_np = (image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
             rendered_frames.append(img_np)
             if (idx + 1) % 10 == 0:

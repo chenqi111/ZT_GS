@@ -9,7 +9,7 @@ LOG_DIR = "/home/chenqi/myworker/Surgical-TSplineGS/output"
 OUTPUT_DIR = os.path.join(LOG_DIR, "figures")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-plt.rcParams.update({'font.family': 'Liberation Serif', 'font.size': 12})
+plt.rcParams.update({'font.family': 'Times New Roman', 'font.size': 13})
 
 def parse_logs(log_path):
     splits = []
@@ -102,11 +102,13 @@ for scene, p in parsed.items():
     print()
 
 # ============ FIGURE (a): Split Gaussian Ratio Heatmap ============
-fig_a, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6.5),
+fig_a, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 7),
                                   gridspec_kw={'width_ratios': [1.2, 1]})
 
-scenes_ordered = ['video_4', 'video_3', 'video_2']
-display_labels = ['Cutting Liver', 'Pulling Lung', 'Pressing Heart']
+all_scenes = ['video_4', 'video_3', 'video_2']
+all_labels = ['Cutting Liver', 'Pulling Lung', 'Pressing Heart']
+scenes_ordered = [s for s in all_scenes if s in parsed]
+display_labels = [all_labels[all_scenes.index(s)] for s in scenes_ordered]
 
 # Metric: total split ops per final Gaussian 
 # Use the max count during each stage as denominator (actual peak size)
@@ -151,7 +153,7 @@ bars1 = ax1.barh(range(len(metrics)), splits_per_init, color=cmap(norm(splits_pe
                  edgecolor='white', linewidth=1.5, height=0.5)
 
 ax1.set_yticks(range(len(metrics)))
-ax1.set_yticklabels(display_labels, fontsize=13)
+ax1.set_yticklabels(display_labels, fontsize=15)
 
 for i, (bar, m) in enumerate(zip(bars1, metrics)):
     total_sp = m['coarse_splits'] + m['fine_splits']
@@ -159,17 +161,17 @@ for i, (bar, m) in enumerate(zip(bars1, metrics)):
     label = (f'{total_sp/init:.1f}x  '
              f'(total splits: {total_sp:,} / init: {init:,})')
     ax1.text(bar.get_width() + 0.5, i, label,
-             va='center', fontsize=9, fontweight='bold')
+             va='center', fontsize=11, fontweight='bold')
 
-ax1.set_xlabel('Split Operations per Initial Gaussian', fontweight='bold', fontsize=12)
-ax1.set_title('(a) Densification Demand by Scene', fontweight='bold', pad=15, fontsize=14)
+ax1.set_xlabel('Split Operations per Initial Gaussian', fontweight='bold', fontsize=14)
+ax1.set_title('(a) Densification Demand by Scene', fontweight='bold', pad=15, fontsize=16)
 ax1.set_xlim(0, max(splits_per_init) * 1.45)
 ax1.invert_yaxis()
 
 sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
 sm.set_array([])
 cbar = fig_a.colorbar(sm, ax=ax1, shrink=0.65, pad=0.02)
-cbar.set_label('Splits per Initial Point', fontweight='bold')
+cbar.set_label('Splits per Initial Point', fontweight='bold', fontsize=13)
 
 # --- Right: Stage-level breakdown (absolute counts) ---
 x = np.arange(len(scenes_ordered))
@@ -186,15 +188,15 @@ bars_f = ax2.bar(x + width/2, f_counts, width, label='Fine Stage',
 
 for i in range(len(scenes_ordered)):
     ax2.text(i - width/2, c_counts[i] + max_y * 0.02,
-             f'{c_counts[i]:,}', ha='center', fontsize=9, fontweight='bold', color='#8b0000')
+             f'{c_counts[i]:,}', ha='center', fontsize=11, fontweight='bold', color='#8b0000')
     ax2.text(i + width/2, f_counts[i] + max_y * 0.02,
-             f'{f_counts[i]:,}', ha='center', fontsize=9, fontweight='bold', color='#8b0000')
+             f'{f_counts[i]:,}', ha='center', fontsize=11, fontweight='bold', color='#8b0000')
 
 ax2.set_xticks(x)
-ax2.set_xticklabels(display_labels, fontsize=11)
-ax2.set_ylabel('Total Split Operations', fontweight='bold', fontsize=12)
-ax2.set_title('(a) Coarse vs Fine Stage Split Counts', fontweight='bold', pad=15, fontsize=13)
-ax2.legend(fontsize=11)
+ax2.set_xticklabels(display_labels, fontsize=13)
+ax2.set_ylabel('Total Split Operations', fontweight='bold', fontsize=14)
+ax2.set_title('(a) Coarse vs Fine Stage Split Counts', fontweight='bold', pad=15, fontsize=15)
+ax2.legend(fontsize=13)
 
 fig_a.tight_layout()
 fig_a.savefig(os.path.join(OUTPUT_DIR, 'fig_a_split_ratio_heatmap.png'),
@@ -243,106 +245,111 @@ def simulate_depth(split_counts, n_init, n_final):
         instability = np.concatenate([instability, new_instability])
         n_total = len(depths)
 
-    if n_total > n_final:
+    if n_total > n_final and n_final > 0:
         idx = np.random.choice(n_total, n_final, replace=False)
         return depths[idx]
-    return depths
+    return depths[:max(n_final, 1)]
 
 depths = simulate_depth(fine_splits, n_init_fine, n_final)
 
 # --- Panel (b1): Depth histogram ---
 ax_b1 = axes[0, 0]
-max_d = min(int(depths.max()) + 1, 8)
-bins = np.arange(-0.5, max_d + 0.5)
-counts, _, _ = ax_b1.hist(depths, bins=bins, color='#3498db', edgecolor='white',
-                           linewidth=1.2, alpha=0.85, rwidth=0.85)
-
-ax_b1.set_xlabel('Split Depth', fontweight='bold', fontsize=12)
-ax_b1.set_ylabel('Number of Gaussians', fontweight='bold', fontsize=12)
-ax_b1.set_title('(b1) Cascading Split Depth Distribution\n(Cutting Liver, Fine Stage)', fontweight='bold', pad=10)
-ax_b1.set_xticks(range(max_d))
+if len(depths) == 0:
+    ax_b1.text(0.5, 0.5, 'No split data available', transform=ax_b1.transAxes, ha='center', fontsize=14)
+else:
+    max_d = min(int(depths.max()) + 1, 8)
+    bins = np.arange(-0.5, max_d + 0.5)
+    counts, _, _ = ax_b1.hist(depths, bins=bins, color='#3498db', edgecolor='white',
+                               linewidth=1.2, alpha=0.85, rwidth=0.85)
+    ax_b1.set_xticks(range(max_d))
+    total = len(depths)
+    for i, cnt in enumerate(counts):
+        if cnt > 0:
+            ax_b1.text(i, cnt + total * 0.005, f'{cnt:,}\n({cnt/total*100:.1f}%)',
+                       ha='center', fontsize=10, fontweight='bold')
+ax_b1.set_xlabel('Split Depth', fontweight='bold', fontsize=14)
+ax_b1.set_ylabel('Number of Gaussians', fontweight='bold', fontsize=14)
+ax_b1.set_title('(b1) Cascading Split Depth Distribution\n(Cutting Liver, Fine Stage)', fontweight='bold', pad=10, fontsize=16)
 ax_b1.grid(axis='y', alpha=0.3, linestyle='--')
-
-total = len(depths)
-for i, cnt in enumerate(counts):
-    if cnt > 0:
-        ax_b1.text(i, cnt + total * 0.005, f'{cnt:,}\n({cnt/total*100:.1f}%)',
-                   ha='center', fontsize=8, fontweight='bold')
 
 # --- Panel (b2): Zoom on cascade (depth ≥ 2) ---
 ax_b2 = axes[0, 1]
-ge2 = depths[depths >= 2]
-if len(ge2) > 0:
-    max_d2 = min(int(ge2.max()) + 1, 9)
-    bins2 = np.arange(1.5, max_d2 + 0.5)
-    cnt2, _, _ = ax_b2.hist(ge2, bins=bins2, color='#e74c3c', edgecolor='white',
-                             linewidth=1.2, rwidth=0.8)
-    ax_b2.set_xticks(range(2, max_d2))
-    for i, c in enumerate(cnt2):
-        if c > 0:
-            ax_b2.text(2 + i, c + len(ge2) * 0.008, str(c), ha='center', fontsize=9, fontweight='bold')
+if len(depths) == 0:
+    ax_b2.text(0.5, 0.5, 'No split data available', transform=ax_b2.transAxes, ha='center', fontsize=14)
 else:
-    ax_b2.text(0.5, 0.5, 'No cascading splits', transform=ax_b2.transAxes, ha='center', fontsize=12)
-
-ax_b2.set_xlabel('Cascade Depth', fontweight='bold', fontsize=12)
-ax_b2.set_ylabel('Count', fontweight='bold', fontsize=12)
-ax_b2.set_title(f'(b2) Cascade Zoom (Depth≥2)\n{len(ge2):,} of {total:,} Gaussians ({len(ge2)/total*100:.1f}%)',
-                fontweight='bold', pad=10)
+    ge2 = depths[depths >= 2]
+    if len(ge2) > 0:
+        max_d2 = min(int(ge2.max()) + 1, 9)
+        bins2 = np.arange(1.5, max_d2 + 0.5)
+        cnt2, _, _ = ax_b2.hist(ge2, bins=bins2, color='#e74c3c', edgecolor='white',
+                                 linewidth=1.2, rwidth=0.8)
+        ax_b2.set_xticks(range(2, max_d2))
+        for i, c in enumerate(cnt2):
+            if c > 0:
+                ax_b2.text(2 + i, c + len(ge2) * 0.008, str(c), ha='center', fontsize=11, fontweight='bold')
+    else:
+        ax_b2.text(0.5, 0.5, 'No cascading splits', transform=ax_b2.transAxes, ha='center', fontsize=14)
+ax_b2.set_xlabel('Cascade Depth', fontweight='bold', fontsize=14)
+ax_b2.set_ylabel('Count', fontweight='bold', fontsize=14)
+ax_b2.set_title(f'(b2) Cascade Zoom (Depth≥2)', fontweight='bold', pad=10, fontsize=16)
 ax_b2.grid(axis='y', alpha=0.3, linestyle='--')
 
 # --- Panel (b3): Split events timeline ---
 ax_b3 = axes[1, 0]
 ns = [s[4] for s in video4['coarse'] + video4['fine']]
-events = np.arange(1, len(ns) + 1)
-ax_b3.bar(events[:12], ns[:12], width=0.35, color='#e74c3c', alpha=0.85, label='Coarse')
-ax_b3.bar(events[11:], ns[11:], width=0.35, color='#c0392b', alpha=0.6, label='Fine')
-ax_b3.axvline(x=12.5, color='#2c3e50', linestyle='--', linewidth=1.5, label='Stage Transition')
-ax_b3.set_xlabel('Densification Event', fontweight='bold', fontsize=12)
-ax_b3.set_ylabel('Gaussians Split per Event', fontweight='bold', fontsize=12)
-ax_b3.set_title('(b3) Split Event Timeline (Cutting Liver)', fontweight='bold', pad=10)
-ax_b3.legend(fontsize=10)
+if len(ns) == 0:
+    ax_b3.text(0.5, 0.5, 'No split events', transform=ax_b3.transAxes, ha='center', fontsize=14)
+else:
+    events = np.arange(1, len(ns) + 1)
+    split_point = min(12, len(ns))
+    ax_b3.bar(events[:split_point], ns[:split_point], width=0.35, color='#e74c3c', alpha=0.85, label='Coarse')
+    ax_b3.bar(events[split_point-1:], ns[split_point-1:], width=0.35, color='#c0392b', alpha=0.6, label='Fine')
+    ax_b3.axvline(x=split_point+0.5, color='#2c3e50', linestyle='--', linewidth=1.5, label='Stage Transition')
+    ax_b3.legend(fontsize=12)
+    cumulative = np.cumsum(ns)
+    ax_c = ax_b3.twinx()
+    ax_c.plot(events, cumulative, 'o-', color='#2c3e50', linewidth=2, markersize=4, alpha=0.8)
+    ax_c.set_ylabel('Cumulative Splits', fontweight='bold', fontsize=13, color='#2c3e50')
+    ax_c.tick_params(axis='y', colors='#2c3e50')
+ax_b3.set_xlabel('Densification Event', fontweight='bold', fontsize=14)
+ax_b3.set_ylabel('Gaussians Split per Event', fontweight='bold', fontsize=14)
+ax_b3.set_title('(b3) Split Event Timeline (Cutting Liver)', fontweight='bold', pad=10, fontsize=16)
 ax_b3.grid(axis='y', alpha=0.3, linestyle='--')
-
-cumulative = np.cumsum(ns)
-ax_c = ax_b3.twinx()
-ax_c.plot(events, cumulative, 'o-', color='#2c3e50', linewidth=2, markersize=4, alpha=0.8)
-ax_c.set_ylabel('Cumulative Splits', fontweight='bold', fontsize=11, color='#2c3e50')
-ax_c.tick_params(axis='y', colors='#2c3e50')
 
 # --- Panel (b4): Mean depth evolution ---
 ax_b4 = axes[1, 1]
-means = []
-n_total = n_init_fine
-all_d = np.zeros(n_init_fine, dtype=int)
-all_instab = np.where(np.random.random(n_init_fine) < 0.3, 3.0, 0.1)
-
-for n_split in fine_splits:
-    n_avail = min(n_split, n_total)
-    if n_total > 0 and n_avail > 0:
-        w = all_instab / all_instab.sum()
-        idx = np.random.choice(n_total, n_avail, replace=False, p=w)
-        pd = all_d[idx].copy()
-        pi = all_instab[idx].copy()
-        keep = np.ones(n_total, dtype=bool)
-        keep[idx] = False
-        all_d = all_d[keep]
-        all_instab = all_instab[keep]
-        all_d = np.concatenate([all_d, np.repeat(pd + 1, 2)])
-        all_instab = np.concatenate([all_instab, np.repeat(pi, 2)])
-        n_total = len(all_d)
-    means.append(np.mean(all_d))
-
-x_m = np.arange(1, len(means) + 1)
-ax_b4.plot(x_m, means, 'o-', color='#8e44ad', linewidth=2, markersize=7)
-ax_b4.fill_between(x_m, means, alpha=0.15, color='#8e44ad')
-for i, v in enumerate(means):
-    ax_b4.text(i + 1, v + max(means) * 0.02, f'{v:.2f}', ha='center', fontsize=8, fontweight='bold')
-
-ax_b4.set_xlabel('Densification Step (Fine Stage)', fontweight='bold', fontsize=12)
-ax_b4.set_ylabel('Mean Split Depth', fontweight='bold', fontsize=12)
-ax_b4.set_title('(b4) Mean Depth Evolution During Training', fontweight='bold', pad=10)
+if len(fine_splits) == 0:
+    ax_b4.text(0.5, 0.5, 'No fine stage data', transform=ax_b4.transAxes, ha='center', fontsize=14)
+else:
+    means = []
+    n_total = n_init_fine
+    all_d = np.zeros(n_init_fine, dtype=int)
+    all_instab = np.where(np.random.random(n_init_fine) < 0.3, 3.0, 0.1)
+    for n_split in fine_splits:
+        n_avail = min(n_split, n_total)
+        if n_total > 0 and n_avail > 0:
+            w = all_instab / all_instab.sum()
+            idx = np.random.choice(n_total, n_avail, replace=False, p=w)
+            pd = all_d[idx].copy()
+            pi = all_instab[idx].copy()
+            keep = np.ones(n_total, dtype=bool)
+            keep[idx] = False
+            all_d = all_d[keep]
+            all_instab = all_instab[keep]
+            all_d = np.concatenate([all_d, np.repeat(pd + 1, 2)])
+            all_instab = np.concatenate([all_instab, np.repeat(pi, 2)])
+            n_total = len(all_d)
+        means.append(np.mean(all_d))
+    x_m = np.arange(1, len(means) + 1)
+    ax_b4.plot(x_m, means, 'o-', color='#8e44ad', linewidth=2, markersize=7)
+    ax_b4.fill_between(x_m, means, alpha=0.15, color='#8e44ad')
+    for i, v in enumerate(means):
+        ax_b4.text(i + 1, v + max(means) * 0.02, f'{v:.2f}', ha='center', fontsize=10, fontweight='bold')
+    ax_b4.set_xticks(x_m)
+ax_b4.set_xlabel('Densification Step (Fine Stage)', fontweight='bold', fontsize=14)
+ax_b4.set_ylabel('Mean Split Depth', fontweight='bold', fontsize=14)
+ax_b4.set_title('(b4) Mean Depth Evolution During Training', fontweight='bold', pad=10, fontsize=16)
 ax_b4.grid(alpha=0.3, linestyle='--')
-ax_b4.set_xticks(x_m)
 
 fig_b.tight_layout()
 fig_b.savefig(os.path.join(OUTPUT_DIR, 'fig_b_split_depth_histogram.png'),
@@ -363,10 +370,11 @@ for scene in scenes_ordered:
           f"{p['total_splits']/max(p['dyn_final'],1):>7.1f}x")
 print()
 
-print(f"Cutting Liver cascade depth distribution (fine stage, n={total:,}):")
-for d_val in range(0, min(6, int(depths.max()) + 1)):
-    cnt = int(np.sum(depths == d_val))
-    print(f"  Depth {d_val}: {cnt:>6,} ({cnt/total*100:.1f}%)")
-ge2_cnt = int(np.sum(depths >= 2))
-print(f"  Depth ≥ 2: {ge2_cnt:>6,} ({ge2_cnt/total*100:.1f}%)")
+if len(depths) > 0:
+    print(f"Cutting Liver cascade depth distribution (fine stage, n={total:,}):")
+    for d_val in range(0, min(6, int(depths.max()) + 1)):
+        cnt = int(np.sum(depths == d_val))
+        print(f"  Depth {d_val}: {cnt:>6,} ({cnt/total*100:.1f}%)")
+    ge2_cnt = int(np.sum(depths >= 2))
+    print(f"  Depth ≥ 2: {ge2_cnt:>6,} ({ge2_cnt/total*100:.1f}%)")
 print(f"\nOutput: {OUTPUT_DIR}/")

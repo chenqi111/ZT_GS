@@ -52,7 +52,13 @@ class ModelParams(ParamGroup):
         self.sh_degree = 3
         self.deform_spatial_scale = 1e-2
         self.rgbfuntion = "sandwich"
-        self.control_num = 12
+        # ZSTF (ZT-GS) hyperparameters. `control_num` is retained as an alias
+        # for backward compatibility; if `zernike_N` is not set, the GaussianModel
+        # falls back to using `control_num` as the Zernike max order N.
+        self.zernike_N = 6                 # max radial order N (paper Sec. IV-A: N=6)
+        self.zernike_omega = 4.0           # temporal winding number (paper: omega=4)
+        self.zernike_beta = 0.5            # exponential decay (paper: beta=0.5)
+        self.control_num = 6               # legacy alias, now interpreted as N
         self.prune_error_threshold = 1.0
         
         self._source_path = ""
@@ -92,14 +98,21 @@ class ModelHiddenParams(ParamGroup):
         self.timenet_output = 6
         self.pixel_base_pe = 5
 
-        # Surgical-TSplineGS hyperparameters
-        self.tass_epsilon = 0.05
-        self.tass_gamma = 2.0
-        self.mgmas_enabled = True
+        # Surgical-TSplineGS / ZT-GS hyperparameters
+        self.tass_epsilon = 0.15              # spectral-entropy rupture threshold (paper Sec. IV-A)
+        self.tass_gamma = 2.0                 # MG-TPC gradient scaling (gamma)
+        self.tass_nlow = 2                    # low/high frequency boundary for bifurcation (Eq. 7)
+        self.mgtpc_tau0 = 0.01                # spectral-order gradient gate base threshold (Eq. 4)
+        self.mgmas_enabled = True             # legacy alias for MG-TPC enable
         self.tass_enabled = True
-        self.lambda_depth_consistency = 0.5
-        self.lambda_traj_smoothness = 0.1
+        self.lambda_depth_consistency = 0.5   # lambda_depth (Eq. 11)
+        self.lambda_traj_smoothness = 0.01    # lambda_sparse: spectral sparsity (Eq. 8)
         self.lambda_masked_rgb = 1.0
+        # Cyclic Spatio-Temporal Evolution Paradigm (Eq. 12): traverse the
+        # sequence forward (t=1->T) then backward (t=T->1) per epoch and
+        # accumulate bidirectional gradients before each optimizer update.
+        self.cyclic_st_enabled = True
+        self.cyclic_accum_steps = 2
         super().__init__(parser, "ModelHiddenParams")
 
 

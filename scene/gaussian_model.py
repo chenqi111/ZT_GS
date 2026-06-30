@@ -15,6 +15,13 @@ import numpy as np
 import torch
 from plyfile import PlyData, PlyElement
 from scene.deformation import pose_network
+from scene.zernike import (
+    fit_zernike,
+    evaluate_zernike_batched,
+    num_modes as zernike_num_modes,
+    mode_orders as zernike_mode_orders,
+    build_mode_list as zernike_build_mode_list,
+)
 from simple_knn._C import distCUDA2
 from torch import nn
 from utils.general_utils import (
@@ -52,33 +59,31 @@ def controlgaussians(opt, gaussians, densify, iteration, scene, flag, is_dynamic
 
 
 def inverse_cubic_hermite(curves, times, N_pts=5, scale=0.8, return_error=False):
-    # times = (times - 0.5) * scale + 0.5
-    # inverse cubic Hermite splines
-    transform_matrix = torch.zeros((times.shape[0], times.shape[1], N_pts), device=curves.device)  # B, T, N_pts
+    """Legacy Hermite spline fitting. Retained for backward compatibility with
+    any external callers / saved checkpoints, but the ZT-GS pipeline now uses
+    `scene.zernike.fit_zernike` for initialization. See ZT_GS.pdf Sec. III-A."""
+    transform_matrix = torch.zeros((times.shape[0], times.shape[1], N_pts), device=curves.device)
     N = N_pts
 
     times_scaled = times * (N - 1)
     indices = torch.floor(times_scaled).long()
 
-    # Clamping to avoid out-of-bounds indices
     indices = torch.clamp(indices, 0, N - 2)
     left_indices = torch.clamp(indices - 1, 0, N - 1)
     right_indices = torch.clamp(indices + 1, 0, N - 1)
     right_right_indices = torch.clamp(indices + 2, 0, N - 1)
 
     t = times_scaled - indices.float()
-    # Hermite basis functions
     h00 = (1 + 2 * t) * (1 - t) ** 2
     h10 = t * (1 - t) ** 2
     h01 = t**2 * (3 - 2 * t)
     h11 = t**2 * (t - 1)
 
-    p1_coef = h00  # B, T, 1
+    p1_coef = h00
     p0_coef = torch.zeros_like(h00)
     p2_coef = h01
     p3_coef = torch.zeros_like(h00)
 
-    # One-sided derivatives at the boundaries
     h10_add_p0 = torch.where(left_indices == indices, 0, -h10 / 2)
     h10_add_p1 = torch.where(left_indices == indices, -h10, 0)
     h10_add_p2 = torch.where(left_indices == indices, h10, h10 / 2)
@@ -92,7 +97,6 @@ def inverse_cubic_hermite(curves, times, N_pts=5, scale=0.8, return_error=False)
     p2_coef = p2_coef + h10_add_p2 + h11_add_p2
     p3_coef = p3_coef + h11_add_p3
 
-    # scatter to transform matrix
     transform_matrix = torch.scatter_reduce(input=transform_matrix, dim=-1, index=left_indices, src=p0_coef, reduce="sum")
     transform_matrix = torch.scatter_reduce(input=transform_matrix, dim=-1, index=indices, src=p1_coef, reduce="sum")
     transform_matrix = torch.scatter_reduce(input=transform_matrix, dim=-1, index=right_indices, src=p2_coef, reduce="sum")
@@ -129,22 +133,42 @@ class GaussianModel:
 
     def __init__(self, args):
         self.active_sh_degree = 0
-        self.control_num = args.control_num
+        # ZSTF hyperparameters (ZT_GS.pdf Sec. III-A, Eq. 1-2).
+        # `control_num` is reinterpreted as the Zernike max order N (kept as
+        # an alias for backward compatibility with config files).
+        self.zernike_N = getattr(args, "zernike_N", None)
+        if self.zernike_N is None:
+            # Fall back to control_num if zernike_N not provided. control_num
+            # historically was the spline control-point count; we interpret
+            # small values (<=12) as N directly to keep configs portable.
+            self.zernike_N = getattr(args, "control_num", 6)
+        self.zernike_omega = getattr(args, "zernike_omega", 4.0)
+        self.zernike_beta = getattr(args, "zernike_beta", 0.5)
+        self._num_modes = zernike_num_modes(self.zernike_N)  # M = (N+1)^2
+        # Keep `control_num` as the number of spectral modes for any code that
+        # still indexes by it (e.g. save/load attribute construction).
+        self.control_num = self._num_modes
         self.deform_spatial_scale = args.deform_spatial_scale
         self.error_threshold = args.prune_error_threshold
-        self.current_control_num = torch.tensor(self.control_num, device="cuda").repeat(1)
+        self.current_control_num = torch.tensor(self._num_modes, device="cuda").repeat(1)
         self.max_sh_degree = args.sh_degree
         self._xyz = torch.empty(0)
         self.control_xyz = torch.empty(0)
 
         self._posenet = None
 
-        # TASS (Topology-Aware Spline Splitting) state
+        # MG-TPC frequency-selective occlusion handling state (Eq. 4).
+        # Per-mode radial orders n (cached for gradient masking).
+        self._mode_orders = zernike_mode_orders(self.zernike_N, device="cuda")
+
+        # TASS (Topology-Aware Spectral Splitting) state (Eq. 5-7).
         self.tass_error_buffer = torch.empty(0)
         self.tass_error_count = torch.empty(0)
         self.tass_split_flags = torch.empty(0)
-        self.tass_epsilon = 0.05
+        self.tass_entropy_prev = torch.empty(0)
+        self.tass_epsilon = 0.15          # spectral-entropy rupture threshold (paper Sec. IV-A)
         self.tass_gamma = 2.0
+        self.tass_nlow = 2                # low-frequency / high-frequency boundary (Eq. 7)
 
         # MG-MAS mask overlap buffer (per Gaussian, updated each iter)
         self.mg_mas_overlap = torch.empty(0)
@@ -236,15 +260,11 @@ class GaussianModel:
             self.active_sh_degree += 1
 
     def flatten_control_point(self):
-        flat_control_point = []
-        for i in range(self.control_xyz.shape[0]):
-            current_control_xyz = self.control_xyz[i][: self.current_control_num.squeeze().long()[i]]
-            flat_control_point.append(current_control_xyz)
-        self.flat_control_xyz = torch.cat(flat_control_point, dim=0).contiguous()
+        # ZSTF: all Gaussians share the same number of modes M=(N+1)^2, so
+        # flattening is a simple reshape (no per-Gaussian slicing needed).
+        self.flat_control_xyz = self.control_xyz.reshape(-1, 3).contiguous()
         self.index_offset = (
-            torch.cat(
-                [torch.zeros(1).cuda(), torch.cumsum(self.current_control_num.squeeze()[:-1], dim=0)], dim=0
-            ).long()
+            torch.arange(self.control_xyz.shape[0], device="cuda") * self._num_modes
         )[:, None]
 
     def add_dummy_control_point(self):
@@ -253,190 +273,50 @@ class GaussianModel:
         )
 
     def onedown_control_pts(self, viewpoints):
-        dummy_step = torch.arange(0, self.control_num, 1).cuda().float()[None].repeat(self.control_xyz.shape[0], 1)
-        time_step = 1 / (self.current_control_num.squeeze(-1) - 1.0)
-        t_step = (dummy_step * time_step[..., None])[..., None]  # t_step corresponding to the current control points
-        new_control_num = self.current_control_num - 1
-        new_control_num[new_control_num < 4] = 4
-        new_control_pts_value = self.inverse_cubic_hermite_for_prune(
-            self.control_xyz, t_step, N_pts=new_control_num
-        )  # reduce 1 control point
-        new_control_pts = self.control_xyz.clone()
-        new_control_pts[:, : self.control_num - 1] = new_control_pts_value
-
-        # update current control number and control points: using 2d projection?
-        error = self.compute_prune_error(new_control_pts, new_control_num, viewpoints)
-        error_threshold = self.error_threshold
-        self.current_control_num[error <= error_threshold] = new_control_num[error <= error_threshold]
-        self.control_xyz[error <= error_threshold] = new_control_pts[error <= error_threshold]
-        print("One down control points: ", (error <= error_threshold).sum().cpu().numpy())
+        # ZSTF: spectral coefficients are not piecewise control points, so the
+        # "reduce one control point" pruning operation from the spline backbone
+        # does not apply. This is now a no-op; spectral sparsity is enforced
+        # through the L1 sparsity loss (Eq. 8) instead.
+        print("onedown_control_pts: skipped (ZSTF uses spectral sparsity, not control-point pruning)")
+        return
 
     def compute_prune_error(self, new_control_pts, new_control_num, viewpoints):
-        K = torch.zeros(3, 3).type_as(self.control_xyz)
-        K[0, 0] = float(self._posenet.focal_bias.exp())
-        K[1, 1] = float(self._posenet.focal_bias.exp())
-        K[0, 2] = float(viewpoints[0].image_width / 2)
-        K[1, 2] = float(viewpoints[0].image_height / 2)
-        K[2, 2] = float(1)
-        pix_err_list = []
-        for idx, viewpoint in enumerate(viewpoints):
-            if idx == 0 or idx == len(viewpoints) - 1:
-                continue  # skip first and last frame
-            deform_means3D = (
-                self.interpolate_cubic_hermite(
-                    self.control_xyz.permute(0, 2, 1),
-                    torch.tensor(viewpoint.time).cuda()[None, None].expand(self.control_xyz.shape[0], 3, 1),
-                    N=self.current_control_num,
-                )
-                * self.deform_spatial_scale
-            )
-            new_deform_means3D = (
-                self.interpolate_cubic_hermite(
-                    new_control_pts.permute(0, 2, 1),
-                    torch.tensor(viewpoint.time).cuda()[None, None].expand(new_control_pts.shape[0], 3, 1),
-                    N=new_control_num,
-                )
-                * self.deform_spatial_scale
-            )
-            deform_means2D = pts2pixel(deform_means3D, viewpoint, K)
-            new_deform_means2D = pts2pixel(new_deform_means3D, viewpoint, K)
-            pix_err_list.append(torch.norm(deform_means2D - new_deform_means2D, dim=-1))
-        return torch.stack(pix_err_list, dim=0).mean(0)
+        # ZSTF: with a fixed number of modes there is no per-Gaussian control
+        # point count to prune. Return zeros so any caller treats the
+        # (unchanged) representation as having zero pruning error.
+        return torch.zeros(self.control_xyz.shape[0], device=self.control_xyz.device)
 
     def inverse_cubic_hermite_for_prune(self, curves, times, N_pts):
-        transform_matrix = torch.zeros(
-            (times.shape[0], self.control_num, self.control_num - 1), device=curves.device
-        )  # B, T, N_pts always maximmum entries
-        dummy_transform_matrix = torch.diag(torch.ones(self.control_num - 1, device=curves.device), -1)[None].repeat(
-            times.shape[0], 1, 1
-        )[:, :, :-1]
-        # dummy_eq = torch.zeros(self.control_num, device=curves.device)
-        # dummy_eq[-1] = 1
-        N = N_pts
+        # ZSTF: legacy spline pruning path is no longer used. Kept as a stub
+        # for backward compatibility with any external callers.
+        return curves[..., :N_pts.shape[0]] if N_pts.dim() > 0 else curves
 
-        times_scaled = times * (N - 1)[:, None]
-        indices = torch.floor(times_scaled).long()
-        # Clamping to avoid out-of-bounds indices
-        indices = torch.clamp(
-            indices,
-            torch.zeros_like(N)[:, None].expand(-1, self.control_num, -1),
-            (N - 2)[:, None].expand(-1, self.control_num, -1),
-        ).long()
-        left_indices = torch.clamp(
-            indices - 1,
-            torch.zeros_like(N)[:, None].expand(-1, self.control_num, -1),
-            (N - 1)[:, None].expand(-1, self.control_num, -1),
-        ).long()
-        right_indices = torch.clamp(
-            indices + 1,
-            torch.zeros_like(N)[:, None].expand(-1, self.control_num, -1),
-            (N - 1)[:, None].expand(-1, self.control_num, -1),
-        ).long()
-        right_right_indices = torch.clamp(
-            indices + 2,
-            torch.zeros_like(N)[:, None].expand(-1, self.control_num, -1),
-            (N - 1)[:, None].expand(-1, self.control_num, -1),
-        ).long()
+    def interpolate_zernike(self, signal, times):
+        """
+        Evaluate the Zernike spectral trajectory field (ZT_GS.pdf Eq. 1).
 
-        t = times_scaled - indices.float()
-        # Hermite basis functions
-        h00 = (1 + 2 * t) * (1 - t) ** 2
-        h10 = t * (1 - t) ** 2
-        h01 = t**2 * (3 - 2 * t)
-        h11 = t**2 * (t - 1)
-
-        p1_coef = h00  # B, T, 1
-        p0_coef = torch.zeros_like(h00)
-        p2_coef = h01
-        p3_coef = torch.zeros_like(h00)
-
-        # One-sided derivatives at the boundaries
-        h10_add_p0 = torch.where(left_indices == indices, 0, -h10 / 2)
-        h10_add_p1 = torch.where(left_indices == indices, -h10, 0)
-        h10_add_p2 = torch.where(left_indices == indices, h10, h10 / 2)
-
-        h11_add_p1 = torch.where(right_right_indices == right_indices, -h11, -h11 / 2)
-        h11_add_p2 = torch.where(right_right_indices == right_indices, h11, 0)
-        h11_add_p3 = torch.where(right_right_indices == right_indices, 0, h11 / 2)
-
-        p0_coef = p0_coef + h10_add_p0
-        p1_coef = p1_coef + h10_add_p1 + h11_add_p1
-        p2_coef = p2_coef + h10_add_p2 + h11_add_p2
-        p3_coef = p3_coef + h11_add_p3
-
-        # scatter to transform matrix
-        transform_matrix = torch.scatter_reduce(input=transform_matrix, dim=-1, index=left_indices, src=p0_coef, reduce="sum")
-        transform_matrix = torch.scatter_reduce(input=transform_matrix, dim=-1, index=indices, src=p1_coef, reduce="sum")
-        transform_matrix = torch.scatter_reduce(
-            input=transform_matrix, dim=-1, index=right_indices, src=p2_coef, reduce="sum"
+        Args:
+            signal: [B, M, 3] Zernike spectral coefficients
+            times:  [B, 3, 1] or [B, 1] per-Gaussian normalized time
+        Returns:
+            mu: [B, 3] trajectory displacement
+        """
+        if times.dim() == 3:
+            t = times[..., 0, 0]
+        elif times.dim() == 2:
+            t = times[:, 0]
+        else:
+            t = times
+        mu = evaluate_zernike_batched(
+            signal, t, N=self.zernike_N, omega=self.zernike_omega, beta=self.zernike_beta, T=1.0
         )
-        transform_matrix = torch.scatter_reduce(
-            input=transform_matrix, dim=-1, index=right_right_indices, src=p3_coef, reduce="sum"
-        )
-
-        valid_mask = torch.ones((times.shape[0], self.control_num), device=curves.device)
-        mask_index = self.current_control_num.squeeze() < self.control_num
-        valid_mask[mask_index] = torch.scatter(
-            input=valid_mask[mask_index],
-            dim=-1,
-            index=(self.current_control_num)[mask_index],
-            src=torch.zeros_like(self.current_control_num).float()[mask_index],
-        )
-        accum_valid_mask = torch.cumprod(valid_mask, dim=-1)
-
-        mask_curves = curves * accum_valid_mask[..., None]
-        mask_transform_matrix = transform_matrix * accum_valid_mask[..., None] + dummy_transform_matrix * (
-            1 - accum_valid_mask[..., None]
-        )
-
-        # # transform_matrix is not full rank, we need to replace 1 eq with dummy eq
-        # valid_mask_2 = torch.ones((times.shape[0], self.control_num), device=curves.device)
-        # valid_mask_2 = torch.scatter(input=valid_mask_2, dim=-1, index=(N_pts - 1), src=torch.zeros_like(self.current_control_num).float())
-        # mask_transform_matrix_2 = mask_transform_matrix * valid_mask_2[...,None] + dummy_eq[None,None] * (1 - valid_mask_2[...,None])
-        control_pts = torch.linalg.lstsq(mask_transform_matrix, mask_curves).solution
-        # error = torch.square(control_pts - torch.linalg.pinv(mask_transform_matrix_2) @ curves).sum(-1).mean(-1)
-        return control_pts
+        return mu
 
     def interpolate_cubic_hermite(self, signal, times, N):
-        times_scaled = times * (N - 1)[:, None]
-        indices = torch.floor(times_scaled).long()
-        # Clamping to avoid out-of-bounds indices
-
-        indices = torch.clamp(
-            indices, torch.zeros_like(N)[:, None].expand(-1, 3, -1), (N - 2)[:, None].expand(-1, 3, -1)
-        ).long()
-        left_indices = torch.clamp(
-            indices - 1, torch.zeros_like(N)[:, None].expand(-1, 3, -1), (N - 1)[:, None].expand(-1, 3, -1)
-        ).long()
-        right_indices = torch.clamp(
-            indices + 1, torch.zeros_like(N)[:, None].expand(-1, 3, -1), (N - 1)[:, None].expand(-1, 3, -1)
-        ).long()
-        right_right_indices = torch.clamp(
-            indices + 2, torch.zeros_like(N)[:, None].expand(-1, 3, -1), (N - 1)[:, None].expand(-1, 3, -1)
-        ).long()
-
-        t = times_scaled - indices.float()
-
-        p0 = torch.gather(signal, -1, left_indices)
-        p1 = torch.gather(signal, -1, indices)
-        p2 = torch.gather(signal, -1, right_indices)
-        p3 = torch.gather(signal, -1, right_right_indices)
-
-        # One-sided derivatives at the boundaries
-        m0 = torch.where(left_indices == indices, (p2 - p1), (p2 - p0) / 2)
-        m1 = torch.where(right_right_indices == right_indices, (p2 - p1), (p3 - p1) / 2)
-
-        # Hermite basis functions
-        h00 = (1 + 2 * t) * (1 - t) ** 2
-        h10 = t * (1 - t) ** 2
-        h01 = t**2 * (3 - 2 * t)
-        h11 = t**2 * (t - 1)
-
-        interpolation = h00 * p1 + h10 * m0 + h01 * p2 + h11 * m1
-        if len(signal.shape) == 3:  # remove extra singleton dimension
-            interpolation = interpolation.squeeze(-1)
-
-        return interpolation
+        # ZSTF: backward-compatibility shim. Callers that still pass splines
+        # are redirected to the Zernike evaluator; `signal` is interpreted as
+        # Zernike spectral coefficients [B, M, 3].
+        return self.interpolate_zernike(signal, times)
 
     def create_from_pcd_dynamic(
         self, pcd: BasicPointCloud, spatial_lr_scale: float, time_line: int, dyn_tracjectory: torch.tensor
@@ -465,11 +345,19 @@ class GaussianModel:
         )
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
-        t_step = torch.linspace(0, 1, dyn_tracjectory.shape[1]).cuda().float()
-        t_step = t_step[None, :, None].expand(dyn_tracjectory.shape[0], -1, -1)
-        init_control_pts = inverse_cubic_hermite(dyn_tracjectory / self.deform_spatial_scale, t_step, N_pts=self.control_num)
-        self.control_xyz = nn.Parameter(init_control_pts.requires_grad_(True))
-        self.current_control_num = torch.tensor(self.control_num, device="cuda").repeat(fused_point_cloud.shape[0])[
+        # ZSTF: fit Zernike spectral coefficients from the sampled trajectory
+        # (replaces inverse_cubic_hermite, ZT_GS.pdf Sec. III-A Eq. 1).
+        t_step = torch.linspace(0, 1, dyn_tracjectory.shape[1]).cuda().float()  # [T]
+        init_coeffs = fit_zernike(
+            dyn_tracjectory / self.deform_spatial_scale,   # [N_dyn, T, 3]
+            t_step,                                         # [T]
+            N=self.zernike_N,
+            omega=self.zernike_omega,
+            beta=self.zernike_beta,
+            T=1.0,
+        )                                                   # [N_dyn, M, 3]
+        self.control_xyz = nn.Parameter(init_coeffs.contiguous().requires_grad_(True))
+        self.current_control_num = torch.tensor(self._num_modes, device="cuda").repeat(fused_point_cloud.shape[0])[
             ..., None
         ]
 
@@ -541,19 +429,12 @@ class GaussianModel:
         )
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
-        mean_x, std_x = torch.mean(fused_point_cloud[..., 0], dim=0), torch.std(fused_point_cloud[..., 0], dim=0)
-        mean_y, std_y = torch.mean(fused_point_cloud[..., 1], dim=0), torch.std(fused_point_cloud[..., 1], dim=0)
-        mean_z, std_z = torch.mean(fused_point_cloud[..., 2], dim=0), torch.std(fused_point_cloud[..., 2], dim=0)
-        std_xyz = torch.tensor([std_x, std_y, std_z], device="cuda")
-        mean_xyz = torch.tensor([mean_x, mean_y, mean_z], device="cuda")
+        # ZSTF: static Gaussians have zero trajectory displacement. Initialize
+        # the Zernike spectral coefficients to zero so mu_g(t) = 0 for all t.
         self.control_xyz = nn.Parameter(
-            (
-                torch.randn(fused_color.shape[0], self.control_num, 3, device="cuda").requires_grad_(True)
-                * std_xyz[None, None]
-                + mean_xyz[None, None]
-            )
+            torch.zeros(fused_color.shape[0], self._num_modes, 3, device="cuda").requires_grad_(True)
         )
-        self.current_control_num = torch.tensor(self.control_num, device="cuda").repeat(fused_color.shape[0], 1)
+        self.current_control_num = torch.tensor(self._num_modes, device="cuda").repeat(fused_color.shape[0], 1)
         # self.control_xyz = nn.Parameter((torch.randn(self.control_num, 3, device="cuda").requires_grad_(True) * std_xyz[None] + mean_xyz[None])[None].repeat(fused_color.shape[0], 1, 1))
         # self.grid = self.grid.to("cuda")
 
@@ -603,66 +484,131 @@ class GaussianModel:
         self.tass_error_count = torch.zeros(n_gaussians, dtype=torch.int, device=device)
         self.tass_split_flags = torch.zeros(n_gaussians, dtype=torch.bool, device=device)
         self.mg_mas_overlap = torch.zeros(n_gaussians, 1, device=device)
+        self.tass_entropy_prev = torch.zeros(n_gaussians, device=device)
 
-    def mg_mas_attenuate_gradients(self, control_point_grads, mask_overlap_ratio):
+    def mg_mas_attenuate_gradients(self, spectral_grads, mask_overlap_ratio):
         """
-        MG-MAS: attenuate control point gradients based on tool mask overlap (Eq. 4).
-        
-        control_point_grads: [N, K, 3] - gradients w.r.t. control points
-        mask_overlap_ratio: [N, 1] - per-Gaussian occlusion ratio (0=no occlusion, 1=fully occluded)
-        
-        Returns: attenuated gradients
+        MG-TPC: Mask-Guided Frequency-Selective Occlusion Handling
+        (ZT_GS.pdf Sec. III-B, Eq. 4).
+
+        For each Gaussian g and each spectral mode (n, m):
+            grad_{n,m} <- grad_{n,m} * exp(-gamma * eta_bar_{n,m} * I(|grad_{n,m}| > tau_n))
+
+        with spectral-order-dependent threshold tau_n = tau0 * (1 + n/N).
+        High-order modes (n ~ N) are aggressively frozen under occlusion,
+        low-order modes (n small) keep optimizing, and the zero-order mode
+        (the Gaussian's global centroid) receives NO attenuation.
+
+        Args:
+            spectral_grads:     [N, M, 3] gradients w.r.t. Zernike spectral coeffs
+            mask_overlap_ratio: [N, 1] per-Gaussian occlusion ratio eta_bar in [0, 1]
+        Returns:
+            attenuated gradients, same shape.
         """
         gamma = getattr(self, 'tass_gamma', 2.0)
-        attenuation = torch.exp(-gamma * mask_overlap_ratio).clamp(min=1e-6)
-        return control_point_grads * attenuation.unsqueeze(-1)
+        tau0 = getattr(self, 'mgtpc_tau0', 0.01)
+        N_z = self.zernike_N
+        M = self._num_modes
+        device = spectral_grads.device
+        # Per-mode radial order n: [M]
+        ns = self._mode_orders.to(device)
+        # tau_n = tau0 * (1 + n / N)  (Eq. 4)
+        tau_n = tau0 * (1.0 + ns / max(N_z, 1))  # [M]
+        # Attenuation factor per (Gaussian, mode): exp(-gamma * eta * 1_{|grad|>tau_n})
+        grad_norm = spectral_grads.norm(dim=-1)  # [N, M]
+        gate = (grad_norm > tau_n.unsqueeze(0)).float()  # [N, M]
+        # eta_bar broadcast: [N, 1] -> [N, M]
+        eta = mask_overlap_ratio.view(-1, 1).clamp(0.0, 1.0)
+        attenuation = torch.exp(-gamma * eta * gate)  # [N, M]
+        # Zero-order mode (n=0): no attenuation, anchor the centroid.
+        zero_order_mask = (ns == 0).unsqueeze(0).float()  # [1, M]
+        attenuation = attenuation * (1.0 - zero_order_mask) + zero_order_mask
+        return spectral_grads * attenuation.unsqueeze(-1)
 
-    def tass_detect_and_split(self, photometric_error, mask_overlap):
+    def spectral_entropy(self, t):
         """
-        TASS: detect topological ruptures and split spline trajectories (Eq. 5, 6).
-        
-        photometric_error: [N] per-Gaussian photometric error at current frame
-        mask_overlap: [N] per-Gaussian mask overlap ratio
-        
-        Returns: list of (parent_idx, child_data) for each split event
+        TASS rupture detection: per-Gaussian normalized spectral energy
+        distribution and its entropy (ZT_GS.pdf Sec. III-C, Eq. 5-6).
+
+        Args:
+            t: scalar normalized time in [0, 1]
+        Returns:
+            S: [N] spectral entropy at time t
+        """
+        coeffs = self.control_xyz  # [N, M, 3]
+        from scene.zernike import conformal_embed, precompute_basis
+        rho, theta = conformal_embed(torch.tensor(float(t), device=coeffs.device), 1.0, self.zernike_omega)
+        rho = rho.expand(coeffs.shape[0])
+        theta = theta.expand(coeffs.shape[0])
+        basis, _ = precompute_basis(rho, theta, self.zernike_N, self.zernike_beta)  # [N, M]
+        # Per-mode energy |C_{n,m} * Z_{n,m}(t)|^2 (summed over xyz channels)
+        energy = (coeffs * basis.unsqueeze(-1)).norm(dim=-1) ** 2  # [N, M]
+        energy = energy + 1e-12
+        p = energy / energy.sum(dim=-1, keepdim=True)  # [N, M]
+        S = -(p * torch.log(p)).sum(dim=-1)  # [N]
+        return S
+
+    def tass_detect_and_split(self, photometric_error, mask_overlap, t_current=None):
+        """
+        TASS: detect topological ruptures via spectral-entropy surges and
+        perform frequency-selective bifurcation (ZT_GS.pdf Sec. III-C,
+        Eq. 5-7).
+
+        Args:
+            photometric_error: [N] per-Gaussian photometric error (fallback signal)
+            mask_overlap:      [N] per-Gaussian mask overlap ratio
+            t_current:         scalar normalized time of the current frame
+        Returns:
+            list of split parent indices
         """
         device = self._xyz.device
         n_gaussians = self._xyz.shape[0]
-        
         if self.tass_error_buffer.shape[0] != n_gaussians:
             self.init_tass_state(n_gaussians)
-        
-        epsilon = getattr(self, 'tass_epsilon', 0.05)
-        
-        # Shift buffer: error[t-2] = error[t-1], error[t-1] = error[t], error[t] = current
-        self.tass_error_buffer = torch.roll(self.tass_error_buffer, -1, dims=0)
-        self.tass_error_buffer[-1, :] = 0
-        self.tass_error_buffer[:, -1] = photometric_error
-        
-        is_high_error = photometric_error > epsilon
-        self.tass_error_count = torch.where(is_high_error, self.tass_error_count + 1, torch.zeros_like(self.tass_error_count))
-        
-        # Trigger split if: error > epsilon for 3 consecutive frames
+            self.tass_entropy_prev = torch.zeros(n_gaussians, device=device)
+
+        epsilon = getattr(self, 'tass_epsilon', 0.15)
+
+        # Primary signal: spectral entropy surge |dS/dt|
+        if t_current is not None:
+            S = self.spectral_entropy(t_current)  # [N]
+            dS = (S - self.tass_entropy_prev).abs()
+            self.tass_entropy_prev = S
+            rupture_signal = dS
+        else:
+            # Fallback to photometric error if time not provided
+            rupture_signal = photometric_error
+
+        is_high_error = rupture_signal > epsilon
+        self.tass_error_count = torch.where(
+            is_high_error, self.tass_error_count + 1, torch.zeros_like(self.tass_error_count)
+        )
+        # Trigger split if rupture signal > epsilon for 3 consecutive frames
         split_mask = (self.tass_error_count >= 3) & ~self.tass_split_flags
-        
+
         split_events = []
         if split_mask.any():
             split_indices = torch.where(split_mask)[0]
             for idx in split_indices:
                 split_events.append(self._tass_split_gaussian(idx.item()))
             self.tass_split_flags[split_mask] = True
-        
+
         return split_events
 
     def _tass_split_gaussian(self, g_idx):
         """
-        Split a single Gaussian's trajectory at detected cut point (Eq. 6).
-        Duplicates the Gaussian into two separate primitives.
+        Frequency-selective trajectory bifurcation (ZT_GS.pdf Eq. 7):
+        the low-frequency part (n <= N_low) stays SHARED between parent and
+        child, while the high-frequency part (n > N_low) diverges independently
+        for the two tissue lips.
         """
-        n, k, _ = self.control_xyz.shape
-        
+        n_gaussians, M, _ = self.control_xyz.shape
+        ns = self._mode_orders.to(self.control_xyz.device)  # [M]
+        nlow = self.tass_nlow
+        low_mask = (ns <= nlow).float()  # [M]
+
         parent_xyz = self._xyz[g_idx:g_idx+1].detach()
-        parent_control = self.control_xyz[g_idx:g_idx+1].detach()
+        parent_control = self.control_xyz[g_idx:g_idx+1].detach()  # [1, M, 3]
         parent_ccn = self.current_control_num[g_idx:g_idx+1].detach()
         parent_f_dc = self._features_dc[g_idx:g_idx+1].detach()
         parent_f_rest = self._features_rest[g_idx:g_idx+1].detach()
@@ -672,11 +618,13 @@ class GaussianModel:
         parent_rotation = self._rotation[g_idx:g_idx+1].detach()
         parent_omega = self._omega[g_idx:g_idx+1].detach()
         parent_split_depth = self.split_depth[g_idx:g_idx+1].detach() if self._track_split_depth else None
-        
-        # Create child: same position/scale/rotation, new trajectory diverges
-        child_control = parent_control.clone() + torch.randn_like(parent_control) * 1e-3
-        
-        # Both start with identical control points; downstream optimization will diverge them
+
+        # Child: low-freq shared, high-freq perturbed to seed divergence.
+        child_control = parent_control.clone()
+        high_freq_noise = torch.randn_like(parent_control) * 1e-2
+        child_control = child_control * low_mask.view(1, M, 1) + \
+                        (child_control + high_freq_noise) * (1.0 - low_mask.view(1, M, 1))
+
         self.densification_postfix(
             parent_xyz,
             child_control,
@@ -690,7 +638,7 @@ class GaussianModel:
             parent_omega,
             new_split_depth=(parent_split_depth + 1) if parent_split_depth is not None else None,
         )
-        
+
         return g_idx
 
     def get_params(self):
